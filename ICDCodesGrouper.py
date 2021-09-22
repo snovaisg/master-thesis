@@ -179,7 +179,6 @@ class ICDCodesGrouper(object):
                     return 0
 
                 def int_lookup(code_):
-                    level_3_code = int(code_[:3])
                     pos = np.digitize(level_3_code,self.bins)
                     chapter = self.chapters_num.Chapter.iloc[pos-1]
                     return chapter
