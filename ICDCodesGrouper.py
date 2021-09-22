@@ -178,18 +178,14 @@ class ICDCodesGrouper(object):
                         return 18
                     return 0
 
-                def int_lookup(code_):
+                def int_lookup(code_: str):
+                    level_3_code = int(code_[:3])
                     pos = np.digitize(level_3_code,self.bins)
                     chapter = self.chapters_num.Chapter.iloc[pos-1]
                     return chapter
 
                 if code_[0] in ['E','V']:
                     return char_lookup(code_)
-                
-                try:
-                    code_ = int(code_)
-                except:
-                    raise ValueError(f'Expecting a code starting with "E", "V", or an integer compatible string. Got instead {code_}')
                 
                 return int_lookup(code_)
 
