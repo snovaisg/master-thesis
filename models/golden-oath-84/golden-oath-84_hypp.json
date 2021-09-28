@@ -1,0 +1,1 @@
+{"input_size": 272, "hidden_size": 100, "num_layers": 1, "n_labels": 272, "rnn_type": "GRU", "dropouti": 0.1, "dropouto": 0.1, "dropoutw": 0.1}
