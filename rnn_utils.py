@@ -81,7 +81,10 @@ class DiagnosesDataset(Dataset):
         train = [list(set(admission)) for admission in train]
         target = [list(set(admission)) for admission in target]
         
-        return {'train':train,'target':target}
+        return {'train':train,
+                'target':target,
+                'pid':self.patients[idx]
+               }
     
     
 def split_dataset(dataset_,test_size_):
@@ -110,8 +113,9 @@ class MYCOLLATE:
         self.dataset = dataset
     
     def __call__(self,batch):
-        patients = {'train':{'sequence':[],'original':[]},
-                    'target':{'sequence':[],'original':[]}}
+        patients = {'train':{'sequence':[],'original':[],'pids':[]},
+                    'target':{'sequence':[],'original':[],'pids':[]}
+                   }
         
         grouping_code = self.dataset.grouping
         n_labels = self.dataset.grouping_data[grouping_code]['n_labels']
@@ -119,7 +123,12 @@ class MYCOLLATE:
         
         # <Nº admissions - 1> of each patient
         seq_lengths = []
+        
+        # 1-to-1 correspondence between each admission in {train/target}_admissions_sequenced and the patient's id.
+        patients_list = []
         for pat in batch:
+            
+            pid = pat['pid'] #patient id
             train_admissions_sequenced = []
             target_admissions_sequenced = []
             seq_lengths.append(len(pat))
@@ -130,6 +139,8 @@ class MYCOLLATE:
                              .sum(dim=0).float() #one-hot of each diagnose to multi-hot vector of diagnoses
                             )
                 train_admissions_sequenced.append(admission)
+            
+            
 
             # convert each target admission into a one-hot vector
             for target_admission in pat['target']:
@@ -157,12 +168,22 @@ class MYCOLLATE:
             
             patients['train']['original'].append(pat['train'])
             patients['target']['original'].append(pat['target'])
+            
+            # repeat pid for each admission they have on target
+            pid_train_list = [pid] * len(pat['train'])
+            pid_target_list = [pid] * len(pat['target'])
+            patients['train']['pids'].extend(pid_train_list)
+            patients['target']['pids'].extend(pid_target_list)
 
         # pad sequences (some patients have more admissions than others)
         patients['train']['sequence'] = pack_sequence(patients['train']['sequence'],enforce_sorted=False)
         patients['target']['sequence'] = pad_sequence(patients['target']['sequence'],batch_first=True)
         
-        return {'train_sequences':patients['train'],'target_sequences':patients['target']}
+        return {'train_sequences':patients['train'],
+                'target_sequences':patients['target'],
+                'train_pids':patients['train']['pids'],
+                'target_pids':patients['target']['pids']
+               }
 
 
 class RNN(nn.Module):
