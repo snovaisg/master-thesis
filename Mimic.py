@@ -5,17 +5,15 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from IPython.display import display
+from config import Settings
 
 class Mimic():
     """
     Class that reads and preprocesses the Mimic dataset
     """
-    def __init__(self, dataset_path = None, grouper=None):
+    def __init__(self, settings : Settings, grouper=None):
         
-        if dataset_path is None:
-            self.path_dataset_folder = '/nas/Datasets/physionet.org/files/mimiciii/1.4/'
-        else:
-            self.path_dataset_folder = dataset_path
+        self.path_dataset_folder = settings.mimic_path
 
         assert os.path.isdir(self.path_dataset_folder), f'Error: Please input a valid path to the dataset. Got: {self.path_dataset_folder}'
             

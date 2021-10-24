@@ -2,6 +2,7 @@
 import pandas as pd
 import numpy as np
 import re
+from config import Settings
 
 class ICDCodesGrouper(object):
     """
@@ -37,18 +38,15 @@ class ICDCodesGrouper(object):
     dtype: int64
     """
     
-    def __init__(self,ccs_path = None,icd9_chapter_path = None):
+    def __init__(self, settings : Settings):
         """
         Parameters
         ----------
         data paths to each grouping method
         """
-        if ccs_path is None:
-            ccs_path = 'grouper_data/CCS-SingleDiagnosisGrouper.txt'
-        if icd9_chapter_path is None:
-            icd9_chapter_path = 'grouper_data/icd9-CM-code-chapter-en=PT.csv'
-        self.ccs = self.CCSSingleDiagnosis(ccs_path)
-        self.icd9chapters = self.ICD9_CM_Chapters(icd9_chapter_path)
+        
+        self.ccs = self.CCSSingleDiagnosis(settings.ccs_path)
+        self.icd9chapters = self.ICD9_CM_Chapters(settings.icd9_chapter_path)
         self.icd9_level3 = self.ICD9_LEVEL3()
         
         self.groupers = {'ccs':self.ccs,'icd9chapters':self.icd9chapters,'icd9_level3':self.icd9_level3}
