@@ -5,13 +5,18 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from IPython.display import display
-from config import Settings
 
 class Mimic():
     """
-    Class that reads and preprocesses the Mimic dataset
+    Class that reads and preprocesses the Mimic dataset.
+    
+    Parameters
+    ----------
+    
+    settings : Class
+        A class that must include a variable "mimic_path" accessible through "settings.mimic_path"
     """
-    def __init__(self, settings : Settings, grouper=None):
+    def __init__(self, settings, grouper=None):
         
         self.path_dataset_folder = settings.mimic_path
 

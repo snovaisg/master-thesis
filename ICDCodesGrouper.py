@@ -38,11 +38,13 @@ class ICDCodesGrouper(object):
     dtype: int64
     """
     
-    def __init__(self, settings : Settings):
+    def __init__(self, settings):
         """
         Parameters
         ----------
-        data paths to each grouping method
+        settings : Class
+            Class with filepaths accessible though: settings.ccs_path, settings.icd9_chapter_path, etc..
+            contains auxiliary data paths of grouping methods
         """
         
         self.ccs = self.CCSSingleDiagnosis(settings.ccs_path)
