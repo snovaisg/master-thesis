@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     data_base : str = 'Define me in .env' # path to save all intermediary data and results
     model_ready_dataset_folder : str = 'Define me in .env' # will be under <data_path>
     eligible_patients_folder : str = 'Define me in .env'# will be under <data_path>
+    models_folder : str = 'Define me in .env'# will be under <data_path>
+    variational_data_folder : str = 'Define me in .env'# will be under <data_path>
+    
 
     class Config:
         env_file = ".env"
