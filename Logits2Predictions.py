@@ -17,7 +17,7 @@ class Logits2Predictions():
     def topk(self,k:int=30):
         """
         k : int
-            recall@k
+            top@k
         """
         temp = self.logits.copy().filter(like='diag_')
         
