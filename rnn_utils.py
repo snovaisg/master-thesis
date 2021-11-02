@@ -35,6 +35,9 @@ class DiagnosesDataset(Dataset):
         
         self.grouping = grouping
         
+        self.__preprocess()
+            
+    def __preprocess(self):
         # necessary data of each code_grouping (eg. ccs, chapters) for posterior padding and one_hot_encoding of batches
         self.grouping_data = {}
         for grouping_code in self.data['metadata']['groupings']:
@@ -60,6 +63,7 @@ class DiagnosesDataset(Dataset):
             self.grouping_data[grouping_code]['int2code'] = int2code
             self.grouping_data[grouping_code]['code2int'] = code2int
             self.grouping_data[grouping_code]['int2code_converter'] = lambda idx: self.grouping_data[grouping_code]['int2code'][idx]
+        
         
     def __str__(self):
         return 'Available groupings: ' +str(self.data['metadata']['groupings'])
@@ -234,6 +238,7 @@ def convert_batch_out_2_predictions_flattened(out,targets,converter : Callable,t
     """Converts the outputs of a model (logits) to list of predictions. Each list is an admission being predicted
     Each admission contains predictions sorted descending by the output of the model
     
+    (old version of out2pred)
     
     """
     activations = nn.Sigmoid()(out).detach().numpy()
