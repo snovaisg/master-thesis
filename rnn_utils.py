@@ -286,6 +286,8 @@ def outs2pred(outs, int2code : dict):
 def eval_model(model, dataloader, dataset, criterion, epoch, name, only_loss=False,level_interest=None,k_interest=None):
     """
     This functions evaluates and computes metrics of a model checkpoint on a dataloader
+    
+    criterion must be reduction='none'
     """
     
     model.eval()
@@ -308,9 +310,19 @@ def eval_model(model, dataloader, dataset, criterion, epoch, name, only_loss=Fal
             # get the inputs; data is a list of [inputs, labels]
             history_sequences, target_sequences = batch['train_sequences'],batch['target_sequences']
 
-            outs = model(history_sequences['sequence'])
+            inputs = history_sequences['sequence']
+            outs = model(inputs)
 
             loss = criterion(outs, target_sequences['sequence'])
+            
+            # zero-out positions of the loss corresponding to padded inputs
+            # if a sequence has all zeros it is considered to be a padding.
+            # Comment: safer way to do this would be a solution using the lengths...
+            sequences,lengths = pad_packed_sequence(inputs,batch_first=True)
+            mask = ~sequences.any(dim=2).unsqueeze(2).repeat(1,1,sequences.shape[-1])
+            loss.masked_fill_(mask, 0)
+        
+            loss = loss.sum() / (lengths.sum()*sequences.shape[-1])
 
             # compute loss
             n = target_sequences['sequence'].size(0)
@@ -365,6 +377,51 @@ def train_one_epoch(model, train_loader, epoch, criterion, optimizer):
         outs = model(history_sequences['sequence'])
         
         loss = criterion(outs, target_sequences['sequence'])
+        loss.backward()
+        
+        optimizer.step()
+        
+        _,lengths = pad_packed_sequence(history_sequences['sequence'])
+        
+        n = lengths.sum().item()
+        
+        total_loss += loss.item() * n
+        total_n += n
+    return total_loss / total_n
+
+
+def train_one_epochV2(model, train_loader, epoch, criterion, optimizer):
+    """
+    Trains one epoch and returns mean loss over training
+    
+    criterion has to have reduction='none'
+    """
+    model.train()
+    
+    total_loss = 0
+    total_n = 0
+    for i, batch in enumerate(iter(train_loader)):
+        # get the inputs; data is a list of [inputs, labels]
+        history_sequences, target_sequences = batch['train_sequences'],batch['target_sequences']
+
+        # zero the parameter gradients
+        model.zero_grad()
+
+        # forward + backward + optimize
+        inputs = history_sequences['sequence']
+        outs = model(inputs)
+        
+        loss = criterion(outs, target_sequences['sequence'])
+        
+        # zero-out positions of the loss corresponding to padded inputs
+        # if a sequence has all zeros it is considered to be a padding.
+        # Comment: safer way to do this would be a solution using the lengths...
+        sequences,lengths = pad_packed_sequence(inputs,batch_first=True)
+        mask = ~sequences.any(dim=2).unsqueeze(2).repeat(1,1,sequences.shape[-1])
+        loss.masked_fill_(mask, 0)
+        
+        loss = loss.sum() / (lengths.sum()*sequences.shape[-1])
+
         loss.backward()
         
         optimizer.step()
