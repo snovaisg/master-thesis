@@ -320,6 +320,7 @@ def eval_model(model, dataloader, dataset, criterion, epoch, name, only_loss=Fal
             # Comment: safer way to do this would be a solution using the lengths...
             sequences,lengths = pad_packed_sequence(inputs,batch_first=True)
             mask = ~sequences.any(dim=2).unsqueeze(2).repeat(1,1,sequences.shape[-1])
+            
             loss.masked_fill_(mask, 0)
         
             loss = loss.sum() / (lengths.sum()*sequences.shape[-1])

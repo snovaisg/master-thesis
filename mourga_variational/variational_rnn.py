@@ -4,7 +4,9 @@ this_dir = os.path.abspath(os.path.dirname(__file__))
 if this_dir not in sys.path:
     sys.path.append(this_dir)
 
+import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_packed_sequence
 
 from locked_dropout import LockedDropout
@@ -52,6 +54,9 @@ class VariationalRNN(nn.Module):
         self.dropoutw = dropoutw               # dropout probability to network units
         self.dropouto = dropouto               # dropout probability to outputs of layers
         
+        self.N = 25 # 25 forward passes in MC dropout
+        #self.T = nn.Parameter(torch.tensor(1.0))
+        
         # create model
         args = lambda l: dict(input_size=input_size if l == 0 else hidden_size,
                               hidden_size=hidden_size,
@@ -80,26 +85,54 @@ class VariationalRNN(nn.Module):
                              out_features= n_labels
                             )
 
-    def forward(self, batch):
+    def forward(self, batch, mc_dropout=False, temperature_scaling=False):
         """
 
-        :param x: tensor of shape (batch_size, seq_len, embedding_size)
-        :param hidden: tuple (h0, c0), each of shape (num_layers * num_directions, batch_size, hidden_size)
-        :param lengths: tensor (size 1 with true lengths)
+        Parameters
+        ----------
+        
+        batch: torch.tensor, size = (batch_size,seq_length,seq_size)
+        
+        mc_dropout : Bool
+            if True then perform self.N forward passes
+        
         :return:
         """
-
-        # Dropout to inputs of the RNN (dropouti)
-        out = self.lockdrop(batch, self.dropouti)
-
-        # for each layer of the RNN
-        for l, rnn in enumerate(self.rnns):
-            # calculate hidden states and output from the l RNN layer
-            out, _ = rnn(out)
-            
-            # apply dropout to the output of the l-th RNN layer (dropouto)
-            out = self.lockdrop(out, self.dropouto)
         
-        out = self.lin(pad_packed_sequence(out,batch_first=True)[0])
+        res = None
+        if mc_dropout:
+            res = list()
+            for npass in range(self.N):
+                # Dropout to inputs of the RNN (dropouti)
+                out = self.lockdrop(batch, self.dropouti)
 
-        return out
+                # for each layer of the RNN
+                for l, rnn in enumerate(self.rnns):
+                    # calculate hidden states and output from the l RNN layer
+                    out, _ = rnn(out)
+
+                    # apply dropout to the output of the l-th RNN layer (dropouto)
+                    out = self.lockdrop(out, self.dropouto)
+
+                out = self.lin(pad_packed_sequence(out,batch_first=True)[0])
+                
+                res.append(out)
+            # average the forward passes
+            res = torch.stack(res).mean(0)
+        else:
+            # Dropout to inputs of the RNN (dropouti)
+            out = self.lockdrop(batch, self.dropouti)
+
+            # for each layer of the RNN
+            for l, rnn in enumerate(self.rnns):
+                # calculate hidden states and output from the l RNN layer
+                out, _ = rnn(out)
+
+                # apply dropout to the output of the l-th RNN layer (dropouto)
+                out = self.lockdrop(out, self.dropouto)
+
+            res = self.lin(pad_packed_sequence(out,batch_first=True)[0])
+
+        #if temperature_scaling:
+        #    res = res / F.relu(self.T)
+        return res
