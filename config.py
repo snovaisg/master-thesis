@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     eligible_patients_folder : str = 'Define me in .env'# will be under <data_path>
     models_folder : str = 'Define me in .env'# will be under <data_path>
     variational_data_folder : str = 'Define me in .env'# will be under <data_path>
+    deterministic_data_folder : str = 'Define me in .env'# will be under <data_path>
     
 
     class Config:

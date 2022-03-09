@@ -1,3 +1,5 @@
 *.ipynb_checkpoints*
 __pycache__*
 wandb*
+data/*
+mimic-iii-clinical-database-1.4/*

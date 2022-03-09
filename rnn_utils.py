@@ -312,8 +312,12 @@ def eval_model(model, dataloader, dataset, criterion, epoch, name, only_loss=Fal
 
             inputs = history_sequences['sequence']
             outs = model(inputs)
+            #print(outs.shape)
+            #print(inputs)
+            #print(target_sequences['sequence'].shape)
 
             loss = criterion(outs, target_sequences['sequence'])
+            #print(inputs)
             
             # zero-out positions of the loss corresponding to padded inputs
             # if a sequence has all zeros it is considered to be a padding.
@@ -321,6 +325,10 @@ def eval_model(model, dataloader, dataset, criterion, epoch, name, only_loss=Fal
             sequences,lengths = pad_packed_sequence(inputs,batch_first=True)
             mask = ~sequences.any(dim=2).unsqueeze(2).repeat(1,1,sequences.shape[-1])
             
+            #print(mask.shape)
+            #print(loss.shape)
+            #print(len(loss))
+            #print(loss)
             loss.masked_fill_(mask, 0)
         
             loss = loss.sum() / (lengths.sum()*sequences.shape[-1])
@@ -374,7 +382,6 @@ def train_one_epoch(model, train_loader, epoch, criterion, optimizer):
         model.zero_grad()
 
         # forward + backward + optimize
-        
         outs = model(history_sequences['sequence'])
         
         loss = criterion(outs, target_sequences['sequence'])
