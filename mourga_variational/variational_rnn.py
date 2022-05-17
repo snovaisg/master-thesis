@@ -18,7 +18,7 @@ class VariationalRNN(nn.Module):
                  hidden_size,
                  n_labels,
                  num_layers=1,
-                 rnn_type='RNN',
+                 rnn_type='rnn',
                  dropouti=0., # dropout probability to inputs
                  dropoutw=0., # dropout probability to network units
                  dropouto=0., # dropout probability to outputs between layers
@@ -40,7 +40,7 @@ class VariationalRNN(nn.Module):
 
         self.lockdrop = LockedDropout()
 
-        assert rnn_type in ['LSTM', 'GRU', 'RNN'], 'type of RNN is not supported'
+        assert rnn_type in ['lstm', 'gru', 'rnn'], 'type of RNN is not supported'
 
         if not isinstance(hidden_size, list):
             nhidden = [hidden_size]
@@ -64,13 +64,13 @@ class VariationalRNN(nn.Module):
                               batch_first=True
                              )
             
-        if rnn_type == 'LSTM':
+        if rnn_type == 'lstm':
             self.rnns = [nn.LSTM(**args(l)) for l in range(num_layers)]
         
-        elif rnn_type == 'GRU':
+        elif rnn_type == 'gru':
             self.rnns = [nn.GRU(**args(l)) for l in range(num_layers)]
             
-        elif rnn_type == 'RNN':
+        elif rnn_type == 'rnn':
             self.rnns = [nn.RNN(**args(l)) for l in range(num_layers)]
             
 
@@ -85,7 +85,7 @@ class VariationalRNN(nn.Module):
                              out_features= n_labels
                             )
 
-    def forward(self, batch, mc_dropout=False, temperature_scaling=False):
+    def forward(self, batch, temperature_scaling=False):
         """
 
         Parameters
@@ -99,27 +99,8 @@ class VariationalRNN(nn.Module):
         :return:
         """
         
-        res = None
-        if mc_dropout:
-            res = list()
-            for npass in range(self.N):
-                # Dropout to inputs of the RNN (dropouti)
-                out = self.lockdrop(batch, self.dropouti)
-
-                # for each layer of the RNN
-                for l, rnn in enumerate(self.rnns):
-                    # calculate hidden states and output from the l RNN layer
-                    out, _ = rnn(out)
-
-                    # apply dropout to the output of the l-th RNN layer (dropouto)
-                    out = self.lockdrop(out, self.dropouto)
-
-                out = self.lin(pad_packed_sequence(out,batch_first=True)[0])
-                
-                res.append(out)
-            # average the forward passes
-            res = torch.stack(res).mean(0)
-        else:
+        res = list()
+        for npass in range(self.N):
             # Dropout to inputs of the RNN (dropouti)
             out = self.lockdrop(batch, self.dropouti)
 
@@ -131,8 +112,10 @@ class VariationalRNN(nn.Module):
                 # apply dropout to the output of the l-th RNN layer (dropouto)
                 out = self.lockdrop(out, self.dropouto)
 
-            res = self.lin(pad_packed_sequence(out,batch_first=True)[0])
+            out = self.lin(pad_packed_sequence(out,batch_first=True)[0])
 
-        #if temperature_scaling:
-        #    res = res / F.relu(self.T)
+            res.append(out)
+        # average the forward passes
+        res = torch.stack(res).mean(0)
+        
         return res
