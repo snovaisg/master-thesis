@@ -20,9 +20,10 @@ import numpy as np
 from math import ceil
 
 import json
+import re
 
 from Metrics import Metrics
-from sklearn.metrics import roc_curve, roc_auc_score,average_precision_score,recall_score,precision_score,f1_score,accuracy_score
+from sklearn.metrics import roc_curve, precision_recall_curveroc_auc_score, average_precision_score, recall_score, precision_score, f1_score, accuracy_score
 
 class DiagnosesDataset(Dataset):
     def __init__(self, diagnoses_file,
@@ -225,7 +226,7 @@ class RNN(nn.Module):
                             out_features=n_labels
                            )
     
-    def forward(self, input):
+    def forward(self, input,**kwargs):
         """
         input: pack_sequence
         
@@ -324,7 +325,7 @@ def compute_loss(model,dataloader):
         for i, batch in enumerate(iter(dataloader)):
             
             inputs, targets = batch['train_sequences']['sequence'],batch['target_sequences']['sequence']
-            outs = model(inputs)
+            outs = model(inputs,take_mc_average=True)
             loss = criterion(outs, targets)
             
             # zero-out positions of the loss corresponding to padded inputs
@@ -364,7 +365,7 @@ def outs2df(model,dataloader,dataset,return_golden=False):
         for i, batch in enumerate(iter(dataloader)):
             
             inputs, targets = batch['train_sequences']['sequence'],batch['target_sequences']['sequence']
-            outs = model(inputs)
+            outs = model(inputs,take_mc_average=True)
             
             # Turn to pandas to store the <model_output> data
             
@@ -408,30 +409,117 @@ def outs2df(model,dataloader,dataset,return_golden=False):
             return full_df,full_golden
     return full_df
 
-def get_prediction_thresholds(prediction_data : pd.DataFrame, golden_data : pd.DataFrame, method='roc gm'):
+
+def outs2df_mc(model, dataloader, dataset, return_golden=False):
+    """
+    Generates model outputs on a dataloader and returns as a pd.DataFrame.
     
-    thresholds_data = None
-    for diag in prediction_data.filter(like='diag_').columns:
-        testy = golden_data.loc[:,diag].to_numpy().reshape((-1,1))
-        yhat = prediction_data.loc[:,diag].to_numpy().reshape((-1,1))
+    If <return_golden> is True, also returns a dataframe with the golden labels.
+    """
+    model.train() # needs to be active for mc_dropout
+    
+     # eg:: ccs, icd9, etc..
+    code_type = dataset.grouping
+    
+    int2code = dataset.grouping_data[code_type]['int2code']
+    n_labels = len(int2code)
+    
+    col_names = ['diag_' + str(code) for code in int2code.keys()]
+    
+    sigmoid = nn.Sigmoid()
+    
+    flatten_list = lambda x: [item for sublist in x for item in sublist]
+    
+    full_df = full_golden = None
+    for i, batch in enumerate(iter(dataloader)):
 
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="No positive samples in y_true, true positive value should be meaningless")
-            fpr, tpr, thresholds = roc_curve(testy, yhat);
+        inputs, targets = batch['train_sequences']['sequence'],batch['target_sequences']['sequence']
+        outs = model(inputs,take_mc_average=False)
 
-        #geometric mean between sensitivity and specificity
-        gmeans = np.sqrt(tpr * (1-fpr))
+        # Turn to pandas to store the <model_output> data
 
-        # locate the index of the largest g-mean
-        ix = np.argmax(gmeans)
+        # we want to ignore the padded sequences
+        _,lengths = pad_packed_sequence(inputs,batch_first=True)
+        relevant_positions = [[i+idx*max(lengths) for i in range(e)] for idx,e in enumerate(lengths)]
+        relevant_positions = flatten_list(relevant_positions)
 
-        threshold = pd.DataFrame(data=[[thresholds[ix],gmeans[ix]]],columns=['threshold','gmean (roc)'],index=[diag])
+        outs_flattened = outs.view(outs.size()[0],1,-1,outs.size()[-1])
+        relevant_outs = outs_flattened[:,:,relevant_positions,:]
+        relevant_outs = sigmoid(relevant_outs).detach().numpy()[:,0,:]
+        
+        # merge the N passes
+        full_df_npass = None
+        for i in range(relevant_outs.shape[0]):
+            df = pd.DataFrame(relevant_outs[i,:,:],columns=col_names)
+            df = df.assign(n_pass=i+1,pat_id=batch['target_pids'])
+            full_df_npass = df if full_df_npass is None else pd.concat([full_df_npass,df])
+        
+        full_df = full_df_npass if full_df is None else pd.concat([full_df,full_df_npass])
 
-        if thresholds_data is None:
-            thresholds_data = threshold
+        if return_golden:
+            targets_flattened = targets.view(1,-1,targets.size()[2])
+            relevant_targets = targets_flattened[:,relevant_positions,:].detach().numpy()[0,:,:]
+            golden_df = (pd.DataFrame(relevant_targets,
+                                    columns=col_names)
+                         .assign(pat_id=batch['target_pids'])
+                        )
+            full_golden = golden_df if full_golden is None else pd.concat([full_golden,golden_df])
+
+    full_df['adm_index'] = full_df.groupby(['pat_id','n_pass']).cumcount()+1
+    full_df = full_df.reset_index(drop=True)
+    full_df[['pat_id','adm_index']] = full_df[['pat_id','adm_index']].astype(int)
+    # reorder columns
+    full_df = full_df.set_index(['pat_id','adm_index','n_pass']).sort_index()
+
+    if return_golden:
+        full_golden['adm_index'] = full_golden.groupby(['pat_id']).cumcount()+1
+        full_golden = full_golden.reset_index(drop=True)
+        full_golden[['pat_id','adm_index']] = full_golden[['pat_id','adm_index']].astype(int)
+        # reorder columns
+        full_golden = full_golden.set_index(['pat_id','adm_index']).sort_index()
+
+        return full_df,full_golden
+    return full_df
+
+
+def get_prediction_thresholds(model_outputs : pd.DataFrame, golden_data : pd.DataFrame, method='roc gm'):
+    
+    supported_methods = ['roc gm','max f1']
+    
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if method == 'max f1':
+            curve = precision_recall_curve
+            metric = lambda precision,recall: 2* (precision*recall) / (precision + recall)
+        elif method == 'roc gm':
+            curve = roc_curve
+            metric = lambda fpr, tpr: np.sqrt(tpr * (1-fpr))
         else:
-            thresholds_data = pd.concat([thresholds_data,threshold])
-    return thresholds_data
+            raise ValueError(f'method must be one of the following: {supported_methods}. Got {method}')
+
+        thresholds_data = None
+        for diag in model_outputs.filter(like='diag_').columns:
+            y_true = golden.loc[:,diag].to_numpy().reshape((-1,1))
+            probas_pred = model_outputs.loc[:,diag].to_numpy().reshape((-1,1))
+
+            x, y, thresholds = curve(y_true, probas_pred);
+
+            if len(thresholds) == 1:
+                threshold = pd.DataFrame(data=[[0.5,np.nan]],columns=['threshold',method],index=[diag])
+            else:
+                scores = metric(x,y)
+                if pd.Series(scores).isna().all():
+                    threshold = pd.DataFrame(data=[[0.5,np.nan]],columns=['threshold',method],index=[diag])
+                else:
+                    ix = pd.Series(scores).idxmax()
+
+                    threshold = pd.DataFrame(data=[[thresholds[ix],scores[ix]]],columns=['threshold',method],index=[diag])
+
+            if thresholds_data is None:
+                thresholds_data = threshold
+            else:
+                thresholds_data = pd.concat([thresholds_data,threshold])
+        return thresholds_data
 
 def make_predictions(model_outputs, golden, prediction_method='roc gm'):
     
@@ -445,7 +533,7 @@ def make_predictions(model_outputs, golden, prediction_method='roc gm'):
     return preds
 
 
-def train_one_epoch(model, train_loader, epoch, criterion, optimizer):
+def train_one_epoch(model, train_loader, epoch, criterion, optimizer, take_mc_average=True):
     """
     Trains one epoch and returns mean loss over training
     
@@ -467,7 +555,7 @@ def train_one_epoch(model, train_loader, epoch, criterion, optimizer):
 
         # forward + backward + optimize
         inputs = history_sequences['sequence']
-        outs = model(inputs)
+        outs = model(inputs,take_mc_average)
         
         loss = criterion(outs, target_sequences['sequence'])
         
@@ -510,7 +598,7 @@ def compute_metrics(model_outputs,model_predictions,golden,metrics):
     metrics : list
         ['roc,avgprec','acc','recall','precision','f1']
     """
-    accepted = ['roc','avgprec','acc','recall','accuracy','precision','f1']
+    accepted = ['roc','avgprec','acc','recall','accuracy','precision','f1','recall@','precision@','f1@']
     
     diag_weights = golden.sum(axis=0)
     adm_weights = golden.sum(axis=1)
@@ -519,7 +607,7 @@ def compute_metrics(model_outputs,model_predictions,golden,metrics):
         metrics = accepted
     
     assert len(metrics) > 0
-    assert any([e in metrics for e in accepted])
+    assert any([e in metrics for e in accepted]) or any([e for e in metrics if 'recall@' in e])
     
     # threshold independent
     diag_metrics = list()
@@ -563,7 +651,51 @@ def compute_metrics(model_outputs,model_predictions,golden,metrics):
         diag_metrics.append(f1_diag)
         adm_metrics.append(f1_adm)
     
+    # i.e. if recall@k in metrics
+    if any(filter(lambda x: re.match('\w+@\d+',x), metrics)):
+        
+        matches = [e[0] for e in [re.findall('\w+@\d+',e) for e in metrics] if e] # get all <metric>@k in metrics (there may be multiple)
+        for match in matches:
+            
+            k = int(re.findall('\w+@(\d+)',match)[0])
+            metric = re.findall('(\w+)@\d+',match)[0]
+            
+            topk_outputs = model_outputs.apply(lambda row: row.nlargest(k),axis=1)
+
+            # fix missing columns from previous operation
+            missing_cols = [col for col in model_outputs.columns if col not in topk_outputs.columns]
+            topk_outputs_all_cols = pd.concat([topk_outputs,pd.DataFrame(columns=missing_cols)])
+            topk_outputs_all_cols = topk_outputs_all_cols[model_outputs.columns]
+            
+            ## sometimes k > (#logits>0) so we will turn all 0 logits into nan so that the following lines don't convert them to predictions
+            topk_outputs_all_cols = topk_outputs_all_cols.mask(topk_outputs_all_cols == 0,np.nan)
+            # done, continuing...
+
+            topk_predictions = np.where(topk_outputs_all_cols.isna(),0,1)
+            topk_predictions = pd.DataFrame(data=topk_predictions,columns=model_predictions.columns,index=model_predictions.index)
+
+            if metric == 'recall':
+
+                metric_at_k_diag = topk_predictions.apply(lambda col: recall_score(golden[col.name],col,zero_division=0)).rename(f'recall@{k}_diag')
+                metric_at_k_adm = topk_predictions.apply(lambda row: recall_score(golden.loc[row.name],row,zero_division=0),axis=1).rename(f'recall@{k}_adm')
+            
+            elif metric == 'precision':
+                metric_at_k_diag = topk_predictions.apply(lambda col: precision_score(golden[col.name],col) if any(topk_predictions[col.name] == 1) else np.nan).rename(f'precision@{k}_diag')
+                metric_at_k_adm = topk_predictions.apply(lambda row: precision_score(golden.loc[row.name],row) if any(topk_predictions.loc[row.name] == 1) else np.nan,axis=1).rename(f'precision@{k}_adm')
+                
+            elif metric == 'f1':
+                metric_at_k_diag = topk_predictions.apply(lambda col: f1_score(golden[col.name],col) if any(golden[col.name] == 1) else np.nan).rename(f'f1@{k}_diag')
+                metric_at_k_adm = topk_predictions.apply(lambda row: f1_score(golden.loc[row.name],row) if any(golden.loc[row.name] == 1) else np.nan,axis=1).rename(f'f1@{k}_adm')
+            
+            else:
+                print('what is happening')
+                print(metric)
+
+            diag_metrics.append(metric_at_k_diag)
+            adm_metrics.append(metric_at_k_adm)        
+    
     # take weighted average
+    """
     diag_metrics_wavg = (pd.concat(diag_metrics,axis=1)
                          .multiply(diag_weights,axis=0)
                          .sum(axis=0)
@@ -579,6 +711,14 @@ def compute_metrics(model_outputs,model_predictions,golden,metrics):
                             adm_weights.sum()
                         )
                        )
+    """
+    diag_metrics_wavg = (pd.concat(diag_metrics,axis=1)
+                         .mean(axis=0)
+                        )
+    
+    adm_metrics_wavg = (pd.concat(adm_metrics,axis=1)
+                         .mean(axis=0)
+                        )
 
     res = pd.concat([diag_metrics_wavg,adm_metrics_wavg])
     

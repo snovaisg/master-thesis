@@ -54,7 +54,7 @@ class VariationalRNN(nn.Module):
         self.dropoutw = dropoutw               # dropout probability to network units
         self.dropouto = dropouto               # dropout probability to outputs of layers
         
-        self.N = 25 # 25 forward passes in MC dropout
+        self.N = 15 # 15 forward passes in MC dropout
         #self.T = nn.Parameter(torch.tensor(1.0))
         
         # create model
@@ -85,7 +85,7 @@ class VariationalRNN(nn.Module):
                              out_features= n_labels
                             )
 
-    def forward(self, batch, temperature_scaling=False):
+    def forward(self, batch, take_mc_average):
         """
 
         Parameters
@@ -115,7 +115,78 @@ class VariationalRNN(nn.Module):
             out = self.lin(pad_packed_sequence(out,batch_first=True)[0])
 
             res.append(out)
-        # average the forward passes
-        res = torch.stack(res).mean(0)
-        
+            
+        res = torch.stack(res)
+        if take_mc_average:
+            res = res.mean(0)
         return res
+
+    
+def outs2df_mc(model,dataloader,dataset,return_golden=False):
+    """
+    Generates model outputs on a dataloader and returns as a pd.DataFrame.
+    
+    If <return_golden> is True, also returns a dataframe with the golden labels.
+    """
+    model.eval()
+    
+     # eg:: ccs, icd9, etc..
+    code_type = dataset.grouping
+    
+    int2code = dataset.grouping_data[code_type]['int2code']
+    n_labels = len(int2code)
+    
+    col_names = ['diag_' + str(code) for code in int2code.keys()]
+    
+    sigmoid = nn.Sigmoid()
+    
+    flatten_list = lambda x: [item for sublist in x for item in sublist]
+    
+    full_df = full_golden = None
+    with torch.no_grad():
+        for i, batch in enumerate(iter(dataloader)):
+            
+            inputs, targets = batch['train_sequences']['sequence'],batch['target_sequences']['sequence']
+            outs = model(inputs,take_mc_average=False)
+            
+            # Turn to pandas to store the <model_output> data
+            
+            # we want to ignore the padded sequences
+            _,lengths = pad_packed_sequence(inputs,batch_first=True)
+            relevant_positions = [[i+idx*max(lengths) for i in range(e)] for idx,e in enumerate(lengths)]
+            relevant_positions = flatten_list(relevant_positions)
+            
+            outs_flattened = outs.view(1,-1,outs.size()[2])
+            relevant_outs = outs_flattened[:,relevant_positions,:]
+            relevant_outs = sigmoid(relevant_outs).detach().numpy()[0,:,:]
+
+            df = (pd.DataFrame(relevant_outs,
+                               columns=col_names)
+                  .assign(pat_id=batch['target_pids'])
+                 )
+            full_df = df if full_df is None else pd.concat([full_df,df])
+            
+            if return_golden:
+                targets_flattened = targets.view(1,-1,targets.size()[2])
+                relevant_targets = targets_flattened[:,relevant_positions,:].detach().numpy()[0,:,:]
+                golden_df = (pd.DataFrame(relevant_targets,
+                                        columns=col_names)
+                             .assign(pat_id=batch['target_pids'])
+                            )
+                full_golden = golden_df if full_golden is None else pd.concat([full_golden,golden_df])
+                    
+        full_df['adm_index'] = full_df.groupby(['pat_id']).cumcount()+1
+        full_df = full_df.reset_index(drop=True)
+        full_df[['pat_id','adm_index']] = full_df[['pat_id','adm_index']].astype(int)
+        # reorder columns
+        full_df = full_df.set_index(['pat_id','adm_index']).sort_index()
+        
+        if return_golden:
+            full_golden['adm_index'] = full_golden.groupby(['pat_id']).cumcount()+1
+            full_golden = full_golden.reset_index(drop=True)
+            full_golden[['pat_id','adm_index']] = full_golden[['pat_id','adm_index']].astype(int)
+            # reorder columns
+            full_golden = full_golden.set_index(['pat_id','adm_index']).sort_index()
+            
+            return full_df,full_golden
+    return full_df
