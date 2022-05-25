@@ -23,7 +23,7 @@ import json
 import re
 
 from Metrics import Metrics
-from sklearn.metrics import roc_curve, precision_recall_curveroc_auc_score, average_precision_score, recall_score, precision_score, f1_score, accuracy_score
+from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, average_precision_score, recall_score, precision_score, f1_score, accuracy_score
 
 class DiagnosesDataset(Dataset):
     def __init__(self, diagnoses_file,
@@ -269,13 +269,16 @@ def convert_batch_out_2_predictions_flattened(out,targets,converter : Callable,t
             predictions_admission.append(code_predictions)
     return predictions_admission
 
-def eval_model(model, dataloader, dataset, metrics, only_loss=False, prediction_method='roc gm',name=None):
+def eval_model(model, dataloader, dataset, decision_thresholds, metrics, only_loss=False,name=None):
     """
     return either the loss or the loss and a metrics dataframe.
     
     
     Parameters:
     -----------
+    
+    decision_thresholds : pd.DataFrame
+        The result of calling the method get_prediction_thresholds
     
     metrics : list
         ['roc,avgprec','acc','recall','precision','f1']
@@ -295,10 +298,10 @@ def eval_model(model, dataloader, dataset, metrics, only_loss=False, prediction_
     
     loss = compute_loss(model, dataloader)
     
-    predictions = make_predictions(model_outputs,golden,prediction_method)
-    
     if only_loss:
         return loss
+    
+    predictions = make_predictions(model_outputs,golden,decision_thresholds)
     
     metrics = compute_metrics(model_outputs,predictions,golden,metrics)
     
@@ -521,14 +524,13 @@ def get_prediction_thresholds(model_outputs : pd.DataFrame, golden_data : pd.Dat
                 thresholds_data = pd.concat([thresholds_data,threshold])
         return thresholds_data
 
-def make_predictions(model_outputs, golden, prediction_method='roc gm'):
+def make_predictions(model_outputs, golden, decision_thresholds):
     
-    thresholds = get_prediction_thresholds(model_outputs,golden,method=prediction_method)
 
     def predict(predictions: pd.Series, threshold : float):
         return predictions.apply(lambda x: 1 if x > threshold else 0)
 
-    preds = model_outputs.apply(lambda x: predict(x, thresholds.loc[x.name,'threshold']),axis=0)
+    preds = model_outputs.apply(lambda x: predict(x, decision_thresholds.loc[x.name,'threshold']),axis=0)
     
     return preds
 
