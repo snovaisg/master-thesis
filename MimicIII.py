@@ -6,7 +6,7 @@ import pandas as pd
 from datetime import datetime
 from IPython.display import display
 
-class Mimic():
+class MimicIII():
     """
     Class that reads and preprocesses the Mimic dataset.
     
@@ -18,7 +18,7 @@ class Mimic():
     """
     def __init__(self, settings, grouper=None):
         
-        self.path_dataset_folder = settings.mimic_path
+        self.path_dataset_folder = os.path.join(settings.mimic_path,settings.mimic_iii_path)
 
         assert os.path.isdir(self.path_dataset_folder), f'Error: Please input a valid path to the dataset. Got: {self.path_dataset_folder}'
             
