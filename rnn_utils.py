@@ -226,7 +226,7 @@ class RNN(nn.Module):
                             out_features=n_labels
                            )
     
-    def forward(self, input,**kwargs):
+    def forward(self, input,ignore=False):
         """
         input: pack_sequence
         
