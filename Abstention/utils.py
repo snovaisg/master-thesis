@@ -80,32 +80,6 @@ def plot_reliability(data, accuracy=False, reliability=False,show_percent=False)
 
 
 
-def get_prediction_thresholds(prediction_data : pd.DataFrame, golden_data : pd.DataFrame, method='roc gm'):
-    
-    thresholds_data = None
-    for diag in prediction_data.filter(like='diag_').columns:
-        testy = golden_data.loc[:,diag].to_numpy().reshape((-1,1))
-        yhat = prediction_data.loc[:,diag].to_numpy().reshape((-1,1))
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="No positive samples in y_true, true positive value should be meaningless")
-            fpr, tpr, thresholds = roc_curve(testy, yhat);
-
-        #geometric mean between sensitivity and specificity
-        gmeans = np.sqrt(tpr * (1-fpr))
-
-        # locate the index of the largest g-mean
-        ix = np.argmax(gmeans)
-
-        threshold = pd.DataFrame(data=[[thresholds[ix],gmeans[ix]]],columns=['threshold','gmean (roc)'],index=[diag])
-
-        if thresholds_data is None:
-            thresholds_data = threshold
-        else:
-            thresholds_data = pd.concat([thresholds_data,threshold])
-    return thresholds_data
-
-
 def ece(logits: pd.Series, preds : pd.Series, goldens : pd.Series, nbins:int = 10):
     
     # confidences of predicted class, not positive class

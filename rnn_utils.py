@@ -25,6 +25,72 @@ import re
 from Metrics import Metrics
 from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, average_precision_score, recall_score, precision_score, f1_score, accuracy_score
 
+from tqdm.auto import tqdm
+
+
+class IcareDataset(Dataset):
+    def __init__(self, diagnoses_file, universe_grouping, grouping='ccs' # desired grouping to use (for both input and output currently),
+                ):
+        
+        # load admissions data
+        with open(diagnoses_file,'r') as fp:
+            self.data = json.load(fp)
+        
+        # list patients
+        self.patients = list(self.data.keys())
+        
+        self.grouping = grouping
+        self.universe_grouping=universe_grouping
+        
+        self.__preprocess()
+            
+    def __preprocess(self):
+        # necessary data of each code_grouping (eg. ccs, chapters) for posterior padding and one_hot_encoding of batches
+        self.grouping_data = {}
+        for grouping_code in self.data[list(self.data.keys())[0]].keys():
+            self.grouping_data[grouping_code] = {}
+            
+            # get all codes of this group
+            all_data_grouping = self.universe_grouping
+            
+            # store n_labels this group
+            self.grouping_data[grouping_code]['n_labels'] = len(set(all_data_grouping))
+            
+            # store unique sorted codes from dataset
+            self.grouping_data[grouping_code]['sorted'] = sorted(set(all_data_grouping))
+            
+            # store code2int & int2code
+            int2code = dict(enumerate(self.grouping_data[grouping_code]['sorted']))
+            code2int = {ch: ii for ii, ch in int2code.items()}
+            
+            self.grouping_data[grouping_code]['int2code'] = int2code
+            self.grouping_data[grouping_code]['code2int'] = code2int
+            self.grouping_data[grouping_code]['int2code_converter'] = lambda idx: self.grouping_data[grouping_code]['int2code'][idx]
+        
+    def __str__(self):
+        return 'Available groupings: ' +str(self.data[list(self.data.keys())[0]].keys())
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        """
+        gets original converted from int2code
+        """
+        patient_data = self.data[self.patients[idx]][self.grouping]
+        
+        train = patient_data['history']
+        target = patient_data['targets']
+        
+        # remove duplicates (can happen in low granuality codes such as ccs)
+        train = [list(set(admission)) for admission in train]
+        target = [list(set(admission)) for admission in target]
+        
+        return {'train':train,
+                'target':target,
+                'pid':self.patients[idx]
+               }
+
 class DiagnosesDataset(Dataset):
     def __init__(self, diagnoses_file,
                  grouping='ccs' # desired grouping to use (for both input and output currently),
@@ -103,6 +169,100 @@ def split_dataset(dataset_,test_size_):
                   ]
                  )
     return a,b
+
+
+class ICareCOLLATE:
+    """
+    This collate class gets a dataset in the format of:
+    [
+    {'train':[[[code1,code2],[code3]],[[etc..],[etc...]]]
+      'target:':[[[code1],[code2]],[[etc..],[etc...]]]
+    },
+     {etc..},
+     etc..
+    ]
+    
+    And outputs a pack of train and pad of test sequences
+    """
+    def __init__(self,dataset):
+        self.dataset = dataset
+    
+    def __call__(self,batch):
+        patients = {'train':{'sequence':[],'original':[],'pids':[]},
+                    'target':{'sequence':[],'original':[],'pids':[]}
+                   }
+        
+        grouping_code = self.dataset.grouping
+        n_labels = self.dataset.grouping_data[grouping_code]['n_labels']
+        code2int = self.dataset.grouping_data[grouping_code]['code2int']
+        
+        # <Nº admissions - 1> of each patient
+        seq_lengths = []
+        
+        # 1-to-1 correspondence between each admission in {train/target}_admissions_sequenced and the patient's id.
+        patients_list = []
+        for pat in batch:
+            
+            pid = pat['pid'] # patient id
+            train_admissions_sequenced = []
+            target_admissions_sequenced = []
+            seq_lengths.append(len(pat['train']))
+
+            # convert each train admission into a multi-hot vector
+            for train_admission in pat['train']:
+                admission = (F.one_hot(torch.tensor(list(map(lambda code: code2int[code],train_admission))),num_classes=n_labels)
+                             .sum(dim=0).float() #one-hot of each diagnose to multi-hot vector of diagnoses
+                            )
+                train_admissions_sequenced.append(admission)
+            
+            
+
+            # convert each target admission into a one-hot vector
+            for target_admission in pat['target']:
+                
+                if not target_admission: # target is empty
+                    admission = torch.zeros(size=(n_labels,))
+                else: #target has at least 1 diagnostic
+                    # convert admission to multi-hot vector
+                    admission = (F.one_hot(torch.tensor(list(map(lambda code: code2int[code],target_admission))),num_classes=n_labels)
+                                 .sum(dim=0).float() #one-hot of each diagnose to multi-hot vector of diagnoses
+                                )
+                target_admissions_sequenced.append(admission)
+
+            # stack multiple train admissions of a single patient into a single tensor
+            if len(train_admissions_sequenced) > 1:
+                train_admissions_sequenced = torch.stack(train_admissions_sequenced)
+            else:
+                train_admissions_sequenced = train_admissions_sequenced[0].view((1,-1))
+
+            # stack multiple target admissions of a single patient into a single tensor
+            if len(target_admissions_sequenced) > 1:
+                target_admissions_sequenced = torch.stack(target_admissions_sequenced)
+            else:
+                target_admissions_sequenced = target_admissions_sequenced[0].view((1,-1))
+
+            # store final train and test tensors
+            patients['train']['sequence'].append(train_admissions_sequenced)
+            patients['target']['sequence'].append(target_admissions_sequenced)
+            
+            patients['train']['original'].append(pat['train'])
+            patients['target']['original'].append(pat['target'])
+            
+            # repeat pid for each admission they have on target
+            pid_train_list = [pid] * len(pat['train'])
+            pid_target_list = [pid] * len(pat['target'])
+            patients['train']['pids'].extend(pid_train_list)
+            patients['target']['pids'].extend(pid_target_list)
+
+        # pad sequences (some patients have more admissions than others)
+        patients['train']['sequence'] = pack_sequence(patients['train']['sequence'],enforce_sorted=False)
+        patients['target']['sequence'] = pad_sequence(patients['target']['sequence'],batch_first=True)
+        
+        return {'train_sequences':patients['train'],
+                'target_sequences':patients['target'],
+                'train_pids':patients['train']['pids'],
+                'target_pids':patients['target']['pids']
+               }
     
 class MYCOLLATE:
     """
@@ -226,7 +386,7 @@ class RNN(nn.Module):
                             out_features=n_labels
                            )
     
-    def forward(self, input,ignore=False):
+    def forward(self, input,ignore=False,take_mc_average=False):
         """
         input: pack_sequence
         
@@ -333,7 +493,7 @@ def compute_loss(model,dataloader):
             
             # zero-out positions of the loss corresponding to padded inputs
             sequences,lengths = pad_packed_sequence(inputs,batch_first=True)
-            mask = ~sequences.any(dim=2).unsqueeze(2).repeat(1,1,sequences.shape[-1])
+            mask = gen_mask_padded_loss(lengths,tuple(loss.shape))
             loss.masked_fill_(mask, 0)
             
             # compute loss
@@ -342,6 +502,31 @@ def compute_loss(model,dataloader):
         
     reducted_loss = total_loss / (total_sequences*n_labels)
     return reducted_loss
+
+def outs2topk(model_outputs : pd.DataFrame, k: int):
+    """
+    Converts model outputs to predictions through a top-k highest.
+    
+    Parameters
+    ----------
+    model_outputs: pd.DataFrame, all columns must be diagnoses
+    """
+    topk_outputs = model_outputs.apply(lambda row: row.nlargest(k),axis=1)
+    
+    # fix missing columns from previous operation
+    original_class_columns = model_outputs.columns
+    missing_cols = [col for col in original_class_columns if col not in topk_outputs.columns]
+    topk_outputs_all_cols = pd.concat([topk_outputs,pd.DataFrame(columns=missing_cols)])
+    topk_outputs_all_cols = topk_outputs_all_cols[original_class_columns]
+
+    topk_predictions = np.where(topk_outputs_all_cols.isna(),0,1)
+    topk_predictions = pd.DataFrame(data=topk_predictions,columns=original_class_columns,index=model_outputs.index)
+    
+    # check all rows contain exactly k positions as 1.
+    assert (topk_predictions.sum(axis=1) == k).all(), 'oops'
+    return topk_predictions
+
+
 
 def outs2df(model,dataloader,dataset,return_golden=False):
     """
@@ -363,9 +548,10 @@ def outs2df(model,dataloader,dataset,return_golden=False):
     
     flatten_list = lambda x: [item for sublist in x for item in sublist]
     
-    full_df = full_golden = None
+    full_df = list()
+    full_golden = list()
     with torch.no_grad():
-        for i, batch in enumerate(iter(dataloader)):
+        for i, batch in tqdm(enumerate(iter(dataloader))):
             
             inputs, targets = batch['train_sequences']['sequence'],batch['target_sequences']['sequence']
             outs = model(inputs,take_mc_average=True)
@@ -376,16 +562,14 @@ def outs2df(model,dataloader,dataset,return_golden=False):
             _,lengths = pad_packed_sequence(inputs,batch_first=True)
             relevant_positions = [[i+idx*max(lengths) for i in range(e)] for idx,e in enumerate(lengths)]
             relevant_positions = flatten_list(relevant_positions)
-            
             outs_flattened = outs.view(1,-1,outs.size()[2])
             relevant_outs = outs_flattened[:,relevant_positions,:]
             relevant_outs = sigmoid(relevant_outs).detach().numpy()[0,:,:]
-
             df = (pd.DataFrame(relevant_outs,
                                columns=col_names)
                   .assign(pat_id=batch['target_pids'])
                  )
-            full_df = df if full_df is None else pd.concat([full_df,df])
+            full_df.append(df)
             
             if return_golden:
                 targets_flattened = targets.view(1,-1,targets.size()[2])
@@ -394,18 +578,23 @@ def outs2df(model,dataloader,dataset,return_golden=False):
                                         columns=col_names)
                              .assign(pat_id=batch['target_pids'])
                             )
-                full_golden = golden_df if full_golden is None else pd.concat([full_golden,golden_df])
-                    
+                full_golden.append(golden_df)
+        
+        full_df = pd.concat(full_df)
+        full_golden = pd.concat(full_golden)
+        
         full_df['adm_index'] = full_df.groupby(['pat_id']).cumcount()+1
         full_df = full_df.reset_index(drop=True)
-        full_df[['pat_id','adm_index']] = full_df[['pat_id','adm_index']].astype(int)
+        #full_df[['pat_id','adm_index']] = full_df[['pat_id','adm_index']].astype(int)
+        full_df['adm_index'] = full_df['adm_index'].astype(int)
         # reorder columns
         full_df = full_df.set_index(['pat_id','adm_index']).sort_index()
         
         if return_golden:
             full_golden['adm_index'] = full_golden.groupby(['pat_id']).cumcount()+1
             full_golden = full_golden.reset_index(drop=True)
-            full_golden[['pat_id','adm_index']] = full_golden[['pat_id','adm_index']].astype(int)
+            #full_golden[['pat_id','adm_index']] = full_golden[['pat_id','adm_index']].astype(int)
+            full_golden['adm_index'] = full_golden['adm_index'].astype(int)
             # reorder columns
             full_golden = full_golden.set_index(['pat_id','adm_index']).sort_index()
             
@@ -502,7 +691,7 @@ def get_prediction_thresholds(model_outputs : pd.DataFrame, golden_data : pd.Dat
 
         thresholds_data = None
         for diag in model_outputs.filter(like='diag_').columns:
-            y_true = golden.loc[:,diag].to_numpy().reshape((-1,1))
+            y_true = golden_data.loc[:,diag].to_numpy().reshape((-1,1))
             probas_pred = model_outputs.loc[:,diag].to_numpy().reshape((-1,1))
 
             x, y, thresholds = curve(y_true, probas_pred);
@@ -580,12 +769,101 @@ def train_one_epoch(model, train_loader, epoch, criterion, optimizer, take_mc_av
         total_loss.append(loss.item())
     return np.mean(total_loss) #no weighted average but whatever.. only the lat batch has different size
 
+def train_one_epochV2(model, train_loader, epoch, criterion, optimizer, take_mc_average=True):
+    """
+    Trains one epoch and returns mean loss over training
+    
+    criterion has to have reduction='none'
+    """
+    model.train()
+    
+    # get n_labels
+    n_labels = next(iter(train_loader))['target_sequences']['sequence'].shape[-1]
+
+    
+    total_loss = []
+    for i, batch in enumerate(iter(train_loader)):
+        # get the inputs; data is a list of [inputs, labels]
+        history_sequences, target_sequences = batch['train_sequences'],batch['target_sequences']
+
+        # zero the parameter gradients
+        model.zero_grad()
+
+        # forward + backward + optimize
+        inputs = history_sequences['sequence']
+        outs = model(inputs,take_mc_average)
+        
+        loss = criterion(outs, target_sequences['sequence'])
+        
+        # zero-out positions of the loss corresponding to padded inputs
+        # if a sequence has all zeros it is considered to be a padding.
+        # Comment: safer way to do this would be a solution using the lengths...
+        sequences,lengths = pad_packed_sequence(inputs,batch_first=True)
+        
+        mask = gen_mask_padded_loss(lengths,tuple(loss.shape))
+        loss.masked_fill_(mask, 0)
+        
+        loss = loss.sum() / (lengths.sum()*sequences.shape[-1])
+
+        loss.backward()
+        
+        optimizer.step()
+        
+        _,lengths = pad_packed_sequence(history_sequences['sequence'])
+        
+        # compute loss
+        total_loss.append(loss.item())
+    return np.mean(total_loss) #no weighted average but whatever.. only the lat batch has different size
+
+def gen_mask_padded_loss(lengths,loss_shape):
+    """
+    This method creates a mask to later perform loss.masked_fill_(mask,0)
+    
+    Note: this method is called at each epoch so has been optimized to some extent
+    since compute delays propagate over many epochs and hyper parameter searches.
+    Hence it may be criptic to understand everything.
+    
+    takes on average 35 ms to run on a batch with shape (64,80,272).
+    
+    Parameters
+    ----------
+    lengths: list, shape = (batch_size,)
+        list with the actual length of each sequence in the batch
+    
+    loss_shape: tuple/list, shape=(batch_size, max_seq_length, n_labels)
+        shape of the loss tensor on a given batch
+    """
+    # i.e. [ (pos_in_batch, seq_size), ...]
+    # e.g. imagine batch of two sequences. first has size 2 and second size 6. we get [(0,2),(1,6)]
+    seq_size_per_seq = list(zip(range(0,len(lengths)),lengths.numpy()))
+
+    # i.e. [ (pos_in_batch,seq_index),(pos_in_batch,seq_index),...]
+    # e.g. imagine batch of two seqs. first has size 2, second has size 1. produces: (0,0),(0,1),(1,0)
+    real_seq_pos_per_seq = [list(zip([a[0]]*a[1],range(0,a[1]))) for a in seq_size_per_seq]
+    # just flattens the previous list
+    real_seq_pos_per_seq = [item for seq in real_seq_pos_per_seq for item in seq] 
+
+    # create mask of which values of the loss to turn off
+    res = (pd.DataFrame(np.ones(shape=(loss_shape[0]*loss_shape[1],loss_shape[2])))
+           .assign(seq=np.array([[seq] * loss_shape[1] for seq in range(len(lengths))]).reshape((-1,1)))
+     .reset_index(drop=False)
+     .set_index(['seq','index']) # index is mean to help in the .loc after this cascade
+     .sort_index()
+      == 1 # all values of dataframe are set to True now.
+    )
+    res.loc[res.index.isin(real_seq_pos_per_seq)] = False # We don't want to zero out these values of the loss
+
+    mask = torch.tensor(res.to_numpy().reshape(loss_shape)) # stack from (batch_size*max_seq_length,n_labels) to (batch_size,max_seq_length,n_labels)
+    
+    # now the mask has the same shape as the loss :)
+    return mask
+
 
 ############################
 ###### METRICS #############
 ############################
 
-def compute_metrics(model_outputs,model_predictions,golden,metrics):
+def compute_metrics(model_outputs,model_predictions,golden,metrics,mode='adm'):
     """
     all input dataframes must be of the form:
     double index of (<pat_id>,>adm_index>)
@@ -600,6 +878,9 @@ def compute_metrics(model_outputs,model_predictions,golden,metrics):
     metrics : list
         ['roc,avgprec','acc','recall','precision','f1']
     """
+    
+    tqdm.pandas()
+    
     accepted = ['roc','avgprec','acc','recall','accuracy','precision','f1','recall@','precision@','f1@']
     
     diag_weights = golden.sum(axis=0)
@@ -614,12 +895,16 @@ def compute_metrics(model_outputs,model_predictions,golden,metrics):
     # threshold independent
     diag_metrics = list()
     adm_metrics = list()
+    res_metrics = list()
     
     if 'roc' in metrics:
-        roc_diag = model_outputs.apply(lambda col: roc_auc_score(golden[col.name],col) if any(golden[col.name] == 1) else np.nan).rename('roc_diag')
-        roc_adm = model_outputs.apply(lambda row: roc_auc_score(golden.loc[row.name],row) if any(golden.loc[row.name] == 1) else np.nan,axis=1).rename('roc_adm')
-        diag_metrics.append(roc_diag)
-        adm_metrics.append(roc_adm)
+        print('computing roc')
+        roc = model_outputs.progress_apply(lambda row: roc_auc_score(golden.loc[row.name],row) if any(golden.loc[row.name] == 1) else np.nan,axis=1).rename('roc_adm') if mode=='adm' else model_outputs.progress_apply(lambda col: roc_auc_score(golden[col.name],col) if any(golden[col.name] == 1) else np.nan).rename('roc_diag')
+        #roc_diag = model_outputs.apply(lambda col: roc_auc_score(golden[col.name],col) if any(golden[col.name] == 1) else np.nan).rename('roc_diag')
+        #roc_adm = model_outputs.apply(lambda row: roc_auc_score(golden.loc[row.name],row) if any(golden.loc[row.name] == 1) else np.nan,axis=1).rename('roc_adm')
+        #diag_metrics.append(roc_diag)
+        #adm_metrics.append(roc_adm)
+        res_metrics.append(roc)
     
     if 'avgprec' in metrics:
         avgprec_diag = model_outputs.apply(lambda col: average_precision_score(golden[col.name],col) if any(golden[col.name] == 1) else np.nan).rename('avgprec_diag')
@@ -674,16 +959,35 @@ def compute_metrics(model_outputs,model_predictions,golden,metrics):
             # done, continuing...
 
             topk_predictions = np.where(topk_outputs_all_cols.isna(),0,1)
-            topk_predictions = pd.DataFrame(data=topk_predictions,columns=model_predictions.columns,index=model_predictions.index)
+            topk_predictions = pd.DataFrame(data=topk_predictions,columns=model_outputs.columns,index=model_outputs.index)
 
             if metric == 'recall':
-
-                metric_at_k_diag = topk_predictions.apply(lambda col: recall_score(golden[col.name],col,zero_division=0)).rename(f'recall@{k}_diag')
-                metric_at_k_adm = topk_predictions.apply(lambda row: recall_score(golden.loc[row.name],row,zero_division=0),axis=1).rename(f'recall@{k}_adm')
+                print(f'computing recall@{k}')
+                metric_at_k = (topk_predictions
+                               .progress_apply(lambda row: recall_score(golden.loc[row.name],row,zero_division=0),axis=1)
+                               .rename(f'recall@{k}_adm') 
+                               if mode=='adm' else 
+                               topk_predictions
+                               .progress_apply(lambda col: recall_score(golden[col.name],col,zero_division=0))
+                               .rename(f'recall@{k}_diag')
+                              )
+                #metric_at_k_diag = topk_predictions.apply(lambda col: recall_score(golden[col.name],col,zero_division=0)).rename(f'recall@{k}_diag')
+                #metric_at_k_adm = topk_predictions.apply(lambda row: recall_score(golden.loc[row.name],row,zero_division=0),axis=1).rename(f'recall@{k}_adm')
             
             elif metric == 'precision':
-                metric_at_k_diag = topk_predictions.apply(lambda col: precision_score(golden[col.name],col) if any(topk_predictions[col.name] == 1) else np.nan).rename(f'precision@{k}_diag')
-                metric_at_k_adm = topk_predictions.apply(lambda row: precision_score(golden.loc[row.name],row) if any(topk_predictions.loc[row.name] == 1) else np.nan,axis=1).rename(f'precision@{k}_adm')
+                print(f'computing precision@{k}')
+                metric_at_k = (topk_predictions
+                                .progress_apply(lambda row: precision_score(golden.loc[row.name],row) 
+                                       if any(topk_predictions.loc[row.name] == 1) else np.nan,axis=1)
+                                .rename(f'precision@{k}_adm') 
+                                if mode=='adm' else 
+                                topk_predictions
+                                .progress_apply(lambda col: precision_score(golden[col.name],col) 
+                                       if any(topk_predictions[col.name] == 1) else np.nan)
+                                .rename(f'precision@{k}_diag')
+                               )
+                #metric_at_k_diag = topk_predictions.apply(lambda col: precision_score(golden[col.name],col) if any(topk_predictions[col.name] == 1) else np.nan).rename(f'precision@{k}_diag')
+                #metric_at_k_adm = topk_predictions.apply(lambda row: precision_score(golden.loc[row.name],row) if any(topk_predictions.loc[row.name] == 1) else np.nan,axis=1).rename(f'precision@{k}_adm')
                 
             elif metric == 'f1':
                 metric_at_k_diag = topk_predictions.apply(lambda col: f1_score(golden[col.name],col) if any(golden[col.name] == 1) else np.nan).rename(f'f1@{k}_diag')
@@ -693,8 +997,9 @@ def compute_metrics(model_outputs,model_predictions,golden,metrics):
                 print('what is happening')
                 print(metric)
 
-            diag_metrics.append(metric_at_k_diag)
-            adm_metrics.append(metric_at_k_adm)        
+            #diag_metrics.append(metric_at_k_diag)
+            #adm_metrics.append(metric_at_k_adm)    
+            res_metrics.append(metric_at_k)
     
     # take weighted average
     """
@@ -714,16 +1019,16 @@ def compute_metrics(model_outputs,model_predictions,golden,metrics):
                         )
                        )
     """
-    diag_metrics_wavg = (pd.concat(diag_metrics,axis=1)
-                         .mean(axis=0)
-                        )
+    #diag_metrics_wavg = (pd.concat(diag_metrics,axis=1)
+    #                     .mean(axis=0)
+    #                    )
     
-    adm_metrics_wavg = (pd.concat(adm_metrics,axis=1)
-                         .mean(axis=0)
-                        )
+    #adm_metrics_wavg = (pd.concat(adm_metrics,axis=1)
+    #                     .mean(axis=0)
+    #                    )
 
-    res = pd.concat([diag_metrics_wavg,adm_metrics_wavg])
-    
+    #res = pd.concat([diag_metrics_wavg,adm_metrics_wavg])
+    res = pd.concat(res_metrics,axis=1).mean(axis=0)
     res.index.name = 'metrics'
     
     return res
