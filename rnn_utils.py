@@ -28,6 +28,147 @@ from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, av
 from tqdm.auto import tqdm
 
 
+class ICareDataset_fast(Dataset):
+    
+    def __init__(self, 
+                 diagnoses_file, 
+                 universe_grouping, 
+                 grouping='ccs', # desired grouping to use (for both input and output currently),
+                 train_size:float = 0.70,
+                 val_size:float = 0.15,
+                 test_size:float = 0.15,
+                 shuffle_dataset:bool = True,
+                 random_seed :int = 432
+                ):
+        
+        assert train_size+val_size+test_size == 1, 'Oops'
+
+        with open(diagnoses_file,'r') as fp:
+            self.raw_data = json.load(fp)
+
+        # list patients
+        self.patients = list(self.raw_data.keys())
+        
+        self.grouping = grouping
+        self.universe_grouping=universe_grouping
+        
+        self.__preprocess()
+        
+        self.data = {}
+        
+        print('processing each patient')
+        for pat in tqdm(self.raw_data):
+            
+            history_sequence = self.adms2multihot(self.raw_data[pat][self.grouping]['history'])
+            target_sequence = self.adms2multihot(self.raw_data[pat][self.grouping]['targets'])
+            
+            self.data[pat] = {'history_sequence':history_sequence,
+                              'target_sequence':target_sequence,
+                              'pid': [pat] * len(self.raw_data[pat][self.grouping]['history'])
+                             }
+        
+        dataset_size = len(self.patients)
+        indices = list(range(dataset_size))
+        if shuffle_dataset :
+            np.random.seed(random_seed)
+            np.random.shuffle(indices)
+            
+        train_split = int(np.floor(train_size * dataset_size))
+        val_split = int(np.floor(val_size * dataset_size))
+        
+        self.train_indices = indices[:train_split]
+        self.val_indices = indices[train_split:train_split+val_split]
+        self.test_indices = indices[(train_split+val_split):]
+            
+            
+    def adms2multihot(self,adms):
+        #print(adms)
+        #print(self.grouping_data[self.grouping]['code2int'].keys())
+        return (torch.stack(
+                                [ F.one_hot( # list comprehension
+                                    # create a multi-hot of diagnoses of each admission
+                                     torch.tensor( 
+                                         list(map(lambda code: self.grouping_data[self.grouping]['code2int'][code],
+                                             set(admission) # we don't care about repeated codes
+                                            ))
+                                     ),
+                                     num_classes=self.grouping_data[self.grouping]['n_labels']
+                                 )
+                                 .sum(dim=0)
+                                 .float()
+                                 if admission 
+                                 else
+                                 torch.zeros(size=(self.grouping_data[self.grouping]['n_labels'],))
+                                 for admission in adms
+                                ]
+                            )
+               )
+    def __preprocess(self):
+        # necessary data of each code_grouping (eg. ccs, chapters) for posterior padding and one_hot_encoding of batches
+        self.grouping_data = {}
+        for grouping_code in self.raw_data[list(self.raw_data.keys())[0]].keys():
+            self.grouping_data[grouping_code] = {}
+
+            # get all codes of this group
+            all_data_grouping = self.universe_grouping
+
+            # store n_labels this group
+            self.grouping_data[grouping_code]['n_labels'] = len(set(all_data_grouping))
+
+            # store unique sorted codes from dataset
+            self.grouping_data[grouping_code]['sorted'] = sorted(set(all_data_grouping))
+
+            # store code2int & int2code
+            int2code = dict(enumerate(self.grouping_data[grouping_code]['sorted']))
+            code2int = {ch: ii for ii, ch in int2code.items()}
+
+            self.grouping_data[grouping_code]['int2code'] = int2code
+            self.grouping_data[grouping_code]['code2int'] = code2int
+            self.grouping_data[grouping_code]['int2code_converter'] = lambda idx: self.grouping_data[grouping_code]['int2code'][idx]
+
+    def __str__(self):
+        return 'Available groupings: ' +str(self.data[list(self.data.keys())[0]].keys())
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        """
+        gets original converted from int2code
+        """
+        patient_data = self.data[self.patients[idx]]
+
+
+        return {'train':patient_data['history_sequence'],
+                'target':patient_data['target_sequence'],
+                'pid': patient_data['pid']
+               }
+    
+    
+    
+class ICareCOLLATE_fast:
+    """
+    This collate class gets a dataset in the format of:
+    [
+    {'train':[[[code1,code2],[code3]],[[etc..],[etc...]]]
+      'target:':[[[code1],[code2]],[[etc..],[etc...]]]
+    },
+     {etc..},
+     etc..
+    ]
+    
+    And outputs a pack of train and pad of test sequences
+    """
+    def __init__(self):
+        pass
+    
+    def __call__(self,batch):
+        return {'train_sequences' : dict(sequence=pack_sequence([batch[i]['train'] for i in range(len(batch))],enforce_sorted=False)),
+                'target_sequences': dict(sequence=pad_sequence([batch[i]['target'] for i in range(len(batch))],batch_first=True)),
+                'pids': [pid for pat in batch for pid in pat['pid']]
+               }
+
+
 class IcareDataset(Dataset):
     def __init__(self, diagnoses_file, universe_grouping, grouping='ccs' # desired grouping to use (for both input and output currently),
                 ):
@@ -485,7 +626,8 @@ def compute_loss(model,dataloader):
     criterion = nn.BCEWithLogitsLoss(reduction='none')
     total_loss = total_sequences = 0
     with torch.no_grad():
-        for i, batch in enumerate(iter(dataloader)):
+        print('forward passing each batch to compute the loss')
+        for i, batch in tqdm(enumerate(iter(dataloader))):
             
             inputs, targets = batch['train_sequences']['sequence'],batch['target_sequences']['sequence']
             outs = model(inputs,take_mc_average=True)
@@ -567,7 +709,7 @@ def outs2df(model,dataloader,dataset,return_golden=False):
             relevant_outs = sigmoid(relevant_outs).detach().numpy()[0,:,:]
             df = (pd.DataFrame(relevant_outs,
                                columns=col_names)
-                  .assign(pat_id=batch['target_pids'])
+                  .assign(pat_id=batch['pids'])
                  )
             full_df.append(df)
             
@@ -576,7 +718,7 @@ def outs2df(model,dataloader,dataset,return_golden=False):
                 relevant_targets = targets_flattened[:,relevant_positions,:].detach().numpy()[0,:,:]
                 golden_df = (pd.DataFrame(relevant_targets,
                                         columns=col_names)
-                             .assign(pat_id=batch['target_pids'])
+                             .assign(pat_id=batch['pids'])
                             )
                 full_golden.append(golden_df)
         
@@ -769,6 +911,39 @@ def train_one_epoch(model, train_loader, epoch, criterion, optimizer, take_mc_av
         total_loss.append(loss.item())
     return np.mean(total_loss) #no weighted average but whatever.. only the lat batch has different size
 
+
+def train_one_batch(model,batch,criterion,optimizer):
+    """
+    Receives a batch of input and labels. trains a model on this data and returns a loss
+    in the form of a dictionary {'total_loss':<sum_of_loss>,'total_sequences':<n_of_sequences_in_batch>}
+    """
+    history_sequences, target_sequences = batch['train_sequences'],batch['target_sequences']
+    
+    # zero the parameter gradients
+    model.zero_grad()
+
+    # forward + backward + optimize
+    inputs = history_sequences['sequence']
+    outs = model(inputs,take_mc_average)
+
+    loss = criterion(outs, target_sequences['sequence'])
+
+    # zero out padded positions of the loss
+    sequences,lengths = pad_packed_sequence(inputs,batch_first=True)
+
+    mask = gen_mask_padded_loss(lengths,tuple(loss.shape))
+    loss.masked_fill_(mask, 0)
+    
+    total_loss = loss.sum().item()
+    total_sequences = lengths.sum().item()
+
+    loss = loss.sum() / (lengths.sum()*sequences.shape[-1])
+
+    loss.backward()
+
+    optimizer.step()
+    return {'total_loss':total_loss,'total_sequences':total_sequences}
+
 def train_one_epochV2(model, train_loader, epoch, criterion, optimizer, take_mc_average=True):
     """
     Trains one epoch and returns mean loss over training
@@ -781,8 +956,10 @@ def train_one_epochV2(model, train_loader, epoch, criterion, optimizer, take_mc_
     n_labels = next(iter(train_loader))['target_sequences']['sequence'].shape[-1]
 
     
-    total_loss = []
-    for i, batch in enumerate(iter(train_loader)):
+    total_loss = 0
+    total_sequences = 0
+    print('Starting to train each batch')
+    for i, batch in tqdm(enumerate(iter(train_loader))):
         # get the inputs; data is a list of [inputs, labels]
         history_sequences, target_sequences = batch['train_sequences'],batch['target_sequences']
 
@@ -796,12 +973,14 @@ def train_one_epochV2(model, train_loader, epoch, criterion, optimizer, take_mc_
         loss = criterion(outs, target_sequences['sequence'])
         
         # zero-out positions of the loss corresponding to padded inputs
-        # if a sequence has all zeros it is considered to be a padding.
-        # Comment: safer way to do this would be a solution using the lengths...
         sequences,lengths = pad_packed_sequence(inputs,batch_first=True)
         
         mask = gen_mask_padded_loss(lengths,tuple(loss.shape))
         loss.masked_fill_(mask, 0)
+        
+        # record loss
+        total_sequences += lengths.sum().item()
+        total_loss += loss.sum().item()
         
         loss = loss.sum() / (lengths.sum()*sequences.shape[-1])
 
@@ -809,21 +988,37 @@ def train_one_epochV2(model, train_loader, epoch, criterion, optimizer, take_mc_
         
         optimizer.step()
         
-        _,lengths = pad_packed_sequence(history_sequences['sequence'])
+    final_loss = total_loss / (total_sequences * n_labels)
+    return final_loss
+
+
+def train_one_epoch_V3(model, train_loader, criterion, optimizer, take_mc_average=True):
+    model.train()
+    
+    # get n_labels
+    n_labels = next(iter(train_loader))['target_sequences']['sequence'].shape[-1]
+
+    
+    loss = {'total_loss':0,'total_sequences':0}
+    print('Starting to train each batch')
+    for i, batch in tqdm(enumerate(iter(train_loader))):
         
-        # compute loss
-        total_loss.append(loss.item())
-    return np.mean(total_loss) #no weighted average but whatever.. only the lat batch has different size
+        batch_loss = train_one_batch(model,batch,criterion,optimizer)
+        
+        loss['total_loss'] += batch_loss['total_loss']
+        loss['total_sequences'] += batch_loss['total_sequences']
+    final_loss = loss['total_loss'] / (loss['total_sequences'] * n_labels)
+    
+    return final_loss
+        
+        
 
 def gen_mask_padded_loss(lengths,loss_shape):
     """
     This method creates a mask to later perform loss.masked_fill_(mask,0)
     
-    Note: this method is called at each epoch so has been optimized to some extent
-    since compute delays propagate over many epochs and hyper parameter searches.
-    Hence it may be criptic to understand everything.
-    
-    takes on average 35 ms to run on a batch with shape (64,80,272).
+    Note: this method is called at each batch so it has been optimized to some extent
+    sacrificing some readibility. Hence it may be criptic to understand everything.
     
     Parameters
     ----------
@@ -833,29 +1028,34 @@ def gen_mask_padded_loss(lengths,loss_shape):
     loss_shape: tuple/list, shape=(batch_size, max_seq_length, n_labels)
         shape of the loss tensor on a given batch
     """
+    idx = pd.IndexSlice
     # i.e. [ (pos_in_batch, seq_size), ...]
     # e.g. imagine batch of two sequences. first has size 2 and second size 6. we get [(0,2),(1,6)]
     seq_size_per_seq = list(zip(range(0,len(lengths)),lengths.numpy()))
 
     # i.e. [ (pos_in_batch,seq_index),(pos_in_batch,seq_index),...]
-    # e.g. imagine batch of two seqs. first has size 2, second has size 1. produces: (0,0),(0,1),(1,0)
+    # e.g. imagine batch of two seqs. first has size 2, second has size 1. produces: [[(0,0),(0,1)],[(1,0)]]
     real_seq_pos_per_seq = [list(zip([a[0]]*a[1],range(0,a[1]))) for a in seq_size_per_seq]
-    # just flattens the previous list
+    # just flattens the previous list.
+    # i.e. (taking the previous example) produces: [(0,0),(0,1),(1,0)]
     real_seq_pos_per_seq = [item for seq in real_seq_pos_per_seq for item in seq] 
 
-    # create mask of which values of the loss to turn off
+    # create a mask that initially has everything as True
     res = (pd.DataFrame(np.ones(shape=(loss_shape[0]*loss_shape[1],loss_shape[2])))
-           .assign(seq=np.array([[seq] * loss_shape[1] for seq in range(len(lengths))]).reshape((-1,1)))
-     .reset_index(drop=False)
-     .set_index(['seq','index']) # index is mean to help in the .loc after this cascade
-     .sort_index()
-      == 1 # all values of dataframe are set to True now.
-    )
-    res.loc[res.index.isin(real_seq_pos_per_seq)] = False # We don't want to zero out these values of the loss
-
-    mask = torch.tensor(res.to_numpy().reshape(loss_shape)) # stack from (batch_size*max_seq_length,n_labels) to (batch_size,max_seq_length,n_labels)
+           .assign(seq=np.array([[seq] * loss_shape[1] for seq in range(len(lengths))]).reshape((-1,1)),
+                   index=list(range(0,loss_shape[1]))*loss_shape[0]
+                  )
+           .set_index(['seq','index']) # index is mean to help in the .loc after this cascade
+           .astype(bool) # all values of dataframe are set to False now.
+          )
     
-    # now the mask has the same shape as the loss :)
+    # set to False the values we don't want to change (aka: values that are not paddings)
+    res.loc[idx[real_seq_pos_per_seq],:] = False
+
+    # stack from (batch_size*max_seq_length,n_labels) to (batch_size,max_seq_length,n_labels)
+    mask = torch.tensor(res.to_numpy().reshape(loss_shape))
+    
+    # now the mask has the same shape as the loss and ready to be applied on torch.masked_fill_
     return mask
 
 
