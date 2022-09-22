@@ -401,6 +401,47 @@ class RNN(nn.Module):
 #############################################################
 ######################### DL UTILS ##########################
 #############################################################
+
+
+class MaskTimesteps():
+    """
+    creates masks above|below|equal to a position, for stacked sequences with variable sized lengths.
+    
+    
+    when length = [5] and level = 3
+    
+    if mode == 'below' returns [0,1,2]
+    if mode == 'above' returns [2,3,4]
+    if mode == 'equal' returns [2]
+    
+    when length = [5,2,3] and level = 3
+    
+    if mode == 'below' returns [0,1,2,5,6,7,8,9] #note: jumps from 2 to 5 because it moved on to sequence 2 which starts at position 5.
+    if mode == 'above' returns [2,3,4,9]
+    if mode == 'equal' returns [2,9]
+    """
+    
+    def __init__(self,mode,k):
+        assert mode in ['above','below','equal'], 'Oops'
+        self.mode = mode
+        self.k = k
+      
+    def __call__(self,lengths):
+        selection_idx = []
+        
+        for seq_pos,length in enumerate(lengths):
+            start_pos = sum(lengths[:seq_pos])
+            if self.mode == 'above':
+                for l in range(self.k-1,length):
+                    selection_idx.append(start_pos+l)
+            elif self.mode == 'below':
+                for l in range(min([self.k,length])):
+                    selection_idx.append(start_pos+l)
+            elif self.mode == 'equal':
+                if self.k <= length:
+                    selection_idx.append(start_pos+level-1)
+        return selection_idx
+                
     
 def gen_non_padded_positions(lengths : list):
     """
@@ -462,7 +503,7 @@ def gen_non_padded_positions(lengths : list):
     return non_padded_positions
 
 
-def compute_loss_dataloader(model, dataloader, criterion):
+def compute_loss_dataloader(model, dataloader, criterion,timestep_selector:Callable=None):
     """
     Computes the loss of N2N model on a particular dataloader.
     """
@@ -473,13 +514,13 @@ def compute_loss_dataloader(model, dataloader, criterion):
     print('Starting to compute the loss on the dataloader')
     with torch.no_grad():
         for i, batch in tqdm(enumerate(dataloader)):
-            batch_loss = compute_loss_batch(model, batch, criterion).item()
+            batch_loss = compute_loss_batch(model, batch, criterion,timestep_selector).item()
             loss.append(batch_loss)
         
     return np.mean(loss) # not true weighted loss but works
                 
                 
-def compute_loss_batch(model,batch,criterion):
+def compute_loss_batch(model,batch,criterion,timestep_selector:Callable=None):
     """
     Computes the loss (sum) of a batch. 
     Ignores padded_positions to obtain a more correct loss.
@@ -491,11 +532,16 @@ def compute_loss_batch(model,batch,criterion):
         reduction of loss.
     """
     
+    lengths = batch['length']
     n_labels = batch['history_mhot'][0].shape[-1]
     
     outs = model(batch['input_pack'],ignore_sigmoid=True)
     
     non_padded_outs = outs2nonpadded(outs,batch['length'])
+    
+    if timestep_selector is not None:
+        mask = timestep_selector(lengths)
+        non_padded_outs = non_padded_outs[mask,:]
     
     loss = criterion(non_padded_outs,batch['target_sequence'])
     
@@ -530,7 +576,7 @@ def outs2nonpadded(outs,lengths):
     return outs.view(-1,outs.shape[-1])[non_padded_positions,:]
 
 
-def train_model_batch(model,batch,criterion,optimizer):
+def train_model_batch(model,batch,criterion,optimizer,timestep_selector:Callable=None):
     """
     Receives a model and a batch of input and labels.
     Trains a model on this data and returns the loss.
@@ -541,7 +587,7 @@ def train_model_batch(model,batch,criterion,optimizer):
     # zero the parameter gradients
     model.zero_grad()
 
-    loss = compute_loss_batch(model,batch,criterion)
+    loss = compute_loss_batch(model,batch,criterion,timestep_selector)
 
     loss.backward()
 
@@ -550,7 +596,7 @@ def train_model_batch(model,batch,criterion,optimizer):
     return loss.item()
 
 
-def train_model_dataloader(model, dataloader, criterion, optimizer):
+def train_model_dataloader(model, dataloader, criterion, optimizer,timestep_selector:Callable=None):
     
     model.train()
     
@@ -558,7 +604,7 @@ def train_model_dataloader(model, dataloader, criterion, optimizer):
     losses = list()
     for i, batch in tqdm(enumerate(dataloader)):
         
-        batch_loss = train_model_batch(model,batch,criterion,optimizer)
+        batch_loss = train_model_batch(model,batch,criterion,optimizer,timestep_selector)
         
         losses.append(batch_loss)
         
@@ -567,17 +613,23 @@ def train_model_dataloader(model, dataloader, criterion, optimizer):
     return dataloader_loss
 
 
-def compute_model_logits_batch(model,batch):
+def compute_model_logits_batch(model,batch,timestep_selector:Callable=None):
     
+    lengths = batch['length']
     logits = model(batch['input_pack'])
+    
+    if timestep_selector is not None:
+        mask = timestep_selector(lengths)
+        logits = logits[mask,:]
     
     non_padded_logits = outs2nonpadded(logits,batch['length'])
     
     return non_padded_logits
 
-def compute_model_preds_batch(model,batch,thresholds : dict):
+def compute_model_preds_batch(model,batch,thresholds : dict,timestep_selector:Callable=None):
     
-    logits = compute_model_logits_batch(model,batch)
+    lengths = batch['length']
+    logits = compute_model_logits_batch(model,batch,timestep_selector)
     
     preds = logits2preds(logits,thresholds)
     
@@ -615,8 +667,8 @@ def build_default_metrics(n_labels):
            #'precision_macro': Precision(num_classes=n_labels,average='macro',multiclass=False),
            #'f1score_weigthed':F1Score(num_classes=n_labels,average='weighted',multiclass=False),
            #'f1score_macro':F1Score(num_classes=n_labels,average='macro',multiclass=False),
-           'auroc_weighted':AUROC(num_classes=n_labels,average='weighted',multiclass=False),
-           'avgprec_weighted':AveragePrecision(num_classes=n_labels,average='weighted',multiclass=False)
+           'auroc_weighted':AUROC(num_classes=n_labels,average=None,multiclass=False),
+           'avgprec_weighted':AveragePrecision(num_classes=n_labels,average=None,multiclass=False)
           }
 
 class Metrics:
@@ -656,15 +708,15 @@ class Metrics:
         res = {}
         for key in self.metrics:
             metric_result = self.metrics[key].compute()
-            for e in metric_result:
-                continue
-            res[key] = {'each':{label:value.item() for label,value in enumerate(metric_result)},
-                        'weighted': sum([self.positives[label]/self.all_positives*value.item() for label,value in enumerate(metric_result)])
+            metric_result = [0 if torch.isnan(e) else e.item() for e in metric_result]
+
+            res[key] = {'each':{label:value for label,value in enumerate(metric_result)},
+                        'weighted': sum([self.positives[label]/self.all_positives*value for label,value in enumerate(metric_result)])
                        }
         return res
     
 
-def compute_metrics_dataloader(metrics, model, dataloader, thresholds: dict):
+def compute_metrics_dataloader(metrics, model, dataloader, thresholds: dict,timestep_selector:Callable=None):
     """
     
     Parameters
@@ -674,14 +726,23 @@ def compute_metrics_dataloader(metrics, model, dataloader, thresholds: dict):
     """
     model.eval()
     
+    
     with torch.no_grad():
         print('Starting to iterate the dataloader to update metrics')
-        for i,batch in tqdm(enumerate(dataloader)):
+        for batch in tqdm(dataloader):
 
+            lengths = batch['length']
             logits = compute_model_logits_batch(model,batch)
+            targets = batch['target_sequence']
+            
+            if timestep_selector is not None:
+                eligible_timesteps = timestep_selector(lengths)
+                
+                logits = logits[eligible_timesteps,:]
+                targets = targets[eligible_timesteps,:]
+            
             preds = logits2preds(logits,thresholds)
-
-            metrics.update(logits,preds,batch['target_sequence'])
+            metrics.update(logits,preds,targets)
 
     print('Now its time to compute metrics. this may take a while')
     return metrics.compute()
@@ -703,7 +764,7 @@ def compute_metrics_batch(metrics: dict, model, batch, thresholds : dict):
     
     return metrics.compute()
 
-def compute_thresholds_dataloader(model,dataloader):
+def compute_thresholds_dataloader(model,dataloader,timestep_selector:Callable=None):
     """
     Computes the best thresholds for a given based on max f1 score on that dataloader
     """
@@ -713,9 +774,16 @@ def compute_thresholds_dataloader(model,dataloader):
     all_target = list()
     print('Iterating the dataloader to obtain the logits and targets')
     for batch in tqdm(iter(dataloader)):
+        lengths = batch['length']
         logits = compute_model_logits_batch(model,batch)
+        targets = batch['target_sequence']
+        
+        if timestep_selector is not None:
+            mask = timestep_selector(lengths)
+            logits = logits[mask,:]
+            targets = targets[mask,:]
 
-        all_target.append(batch['target_sequence'])
+        all_target.append(targets)
         all_logits.append(logits)
 
     all_logits = torch.vstack(all_logits)
@@ -773,43 +841,59 @@ def compute_thresholds_dataloader(model,dataloader):
 ######################## Target statistics ####################
 ###############################################################
 
-def compute_positives_batch(batch,how : str='all'):
+def compute_positives_batch(batch,how : str='all',timestep_selector:Callable=None):
     assert how in ['all','each'], 'Oops'
     
-    if how == 'all':
-        return batch['target_sequence'].sum().item()
-    else:
-        return {label:value for label,value in enumerate(batch['target_sequence'].sum(axis=0).tolist())}
+    targets = batch['target_sequence']
+    if timestep_selector is not None:
+        mask = timestep_selector(lengths)
+        targets = targets[mask,:]
     
-def compute_positives_dataloader(dataloader,how : str='all'):
+    positives_per_diag = targets.sum(axis=0).tolist()
+    
+    if how == 'all':
+        return sum(targets)
+    else:
+        return {label:value for label,value in enumerate(targets)}
+    
+def compute_positives_dataloader(dataloader,how : str='all',timestep_selector:Callable=None):
     assert how in ['all','each'], 'Oops'
     
     if how == 'all':
         positives = 0
         print('iterating dataloader to compute n_positives')
         for batch in tqdm(dataloader):
-            positives += compute_positives_batch(batch,how)
+            positives += compute_positives_batch(batch,how,timestep_selector)
     else:
         positives = None
         print('iterating dataloader to compute n_positives')
         for batch in tqdm(dataloader):
-            positives_batch = compute_positives_batch(batch,how)
+            positives_batch = compute_positives_batch(batch,how,timestep_selector)
             if positives is None:
                 positives = positives_batch
-            else:
-                positives = {k:positives[k]+positives_batch[k] for k in positives}
+            for k in positives:
+                positives[k] += positives_batch[k]
     return positives
 
-def compute_size_batch(batch,how:str='all'):
+def compute_size_batch(batch,how:str='all',timestep_selector:Callable=None):
     assert how in ['all','each'], 'Oops'
     
+    lengths = batch['length']
+    targets = batch['target_sequence']
+    
+    if timestep_selector is not None:
+        mask = timestep_selector(lengths)
+        targets = targets[mask,:]
+    
     if how =='all':
-        return torch.numel(batch['target_sequence'])
+        return torch.numel(targets)
     else:
-        n_seqs = batch['target_sequence'].shape[0]
-        n_labels = batch['target_sequence'].shape[1]
+        n_seqs = targets.shape[0]
+        n_labels = targets.shape[1]
         return {i:n_seqs for i in range(n_labels)}
-def compute_size_dataloader(dataloader,how='all'):
+   
+   
+def compute_size_dataloader(dataloader,how='all',timestep_selector:Callable=None):
     
     assert how in ['all','each'], 'Oops'
     
@@ -817,31 +901,32 @@ def compute_size_dataloader(dataloader,how='all'):
         size = 0
         print('iterating dataloader to compute size')
         for batch in tqdm(dataloader):
-            size += compute_size_batch(batch,how)
+            size += compute_size_batch(batch,how,timestep_selector)
     else:
         size = None
         print('iterating dataloader to compute size')
         for batch in tqdm(dataloader):
-            size_batch = compute_size_batch(batch,how)
+            size_batch = compute_size_batch(batch,how,timestep_selector)
             if size is None:
                 size = size_batch
             else:
-                size = {k:size[k]+size_batch[k] for k in size}
+                for k in size:
+                    size[k] += size_batch[k]
     return size
     
-def compute_prevalence_batch(batch,how='all'):
+def compute_prevalence_batch(batch,how='all',timestep_selector:Callable=None):
     
     assert how in ['all','each'], 'Oops'
     
-    positives = compute_positives_batch(batch,how)
-    size = compute_size_batch(batch,how)
+    positives = compute_positives_batch(batch,how,timestep_selector)
+    size = compute_size_batch(batch,how,timestep_selector)
     
     if how == 'all':
         return positives / size
     else:
         return {k:positives[k]/size[k] for k in positives}
     
-def compute_prevalence_dataloader(dataloader,how='all'):
+def compute_prevalence_dataloader(dataloader,how='all',timestep_selector:Callable=None):
     
     assert how in ['all','each'], 'Oops'
     
@@ -849,8 +934,8 @@ def compute_prevalence_dataloader(dataloader,how='all'):
     
     print('iterating dataloader to compute prevalence')
     for batch in tqdm(dataloader):
-        positives_batch = compute_positives_batch(batch,how)
-        size_batch = compute_size_batch(batch,how)
+        positives_batch = compute_positives_batch(batch,how,timestep_selector)
+        size_batch = compute_size_batch(batch,how,timestep_selector)
         
         if how == 'all':
             if positives is None:
@@ -864,8 +949,10 @@ def compute_prevalence_dataloader(dataloader,how='all'):
                 positives = positives_batch
                 size = size_batch
             else:
-                positives = {k:positives[k]+positives_batch[k] for k in positives}
-                size = {k:size[k]+size_batch[k] for k in size}
+                for k in positives:
+                    positives[k] += positives_batch[k]
+                    size[k] += size_batch[k]
+                    
     if how == 'all':
         return positives / size
     else:
@@ -876,17 +963,21 @@ def compute_prevalence_dataloader(dataloader,how='all'):
 ########################## UTILS ############################
 #############################################################
 
-def compute_n_preds_batch(model,batch,thresholds : dict,how:str='all'):
+def compute_n_preds_batch(model,batch,thresholds : dict,how:str='all',timestep_selector:Callable=None):
     """
     Computes number of predictions
     """
     
     assert how in ['all','each'], 'Oops'
     
-    
+    lengths = batch['length']
     logits = model(batch['input_pack'])
 
     logits = outs2nonpadded(logits,batch['length'])
+    
+    if timestep_selector is not None:
+        mask = timestep_selector(lengths)
+        logits = logits[mask,:]
 
     preds = logits2preds(logits,thresholds)
     
@@ -897,14 +988,14 @@ def compute_n_preds_batch(model,batch,thresholds : dict,how:str='all'):
         n_preds = {label:value for label,value in enumerate(n_preds)}
     return n_preds
 
-def compute_n_preds_dataloader(model,dataloader,thresholds : dict,how:str='all'):
+def compute_n_preds_dataloader(model,dataloader,thresholds : dict,how:str='all',timestep_selector:Callable=None):
     
     assert how in ['all','each'], 'Oops'
     
     n_preds = None
     print('iterating dataloader to compute n_preds')
     for batch in tqdm(dataloader):
-        n_preds_batch = compute_n_preds_batch(model,batch,thresholds,how=how)
+        n_preds_batch = compute_n_preds_batch(model,batch,thresholds,how=how,timestep_selector=timestep_selector)
         if n_preds is None:
             n_preds = n_preds_batch
         else:
