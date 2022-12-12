@@ -141,6 +141,52 @@ class ICDCodesGrouper(object):
                 return lookup_single(code)
             else:
                 raise ValueError(f'Wrong input type. Expecting str or pd.Series. Got {type(code)}')
+                
+    class CCI:
+        def __init__(self,cci_path):
+            self.cci_path = cci_path
+
+            self.data = self._read_and_process()
+            self._lookup_table = self.data.set_index('ICD-9-CM CODE')['CHRONIC'].to_dict()
+
+
+        def lookup(self,code):
+                """
+                Given an icd9 code, returns the corresponding Chronic value (True for chronic, and False for not-chronic)
+
+                Parameters
+                ----------
+
+                code : str | pd.Series
+                    icd9 code
+
+                Returns:
+                    -1: code is not recognizable
+                    True: When the code is chronic
+                    False: when the code is not chronic
+                """
+                def lookup_single(code : str):
+                    try:
+                        return self._lookup_table[code]
+                    except:
+                        return np.nan
+                if type(code) == pd.Series:
+                    return code.apply(lookup_single)
+                elif type(code) == 'str':
+                    return lookup_single(code)
+                else:
+                    raise ValueError(f'Wrong input type. Expecting str or pd.Series. Got {type(code)}')
+
+
+        def _read_and_process(self):
+            df = pd.read_csv('grouper_data/cci2015.csv',usecols=[0,2])
+            df.columns = [col.replace("'","") for col in df.columns]
+            df['ICD-9-CM CODE'] = df['ICD-9-CM CODE'].str.replace("'","").str.strip()
+            df['CATEGORY DESCRIPTION'] = df['CATEGORY DESCRIPTION'].str.replace("'","").str.strip()
+            df = df.rename(columns={'CATEGORY DESCRIPTION':'CHRONIC'})
+            df['CHRONIC'] = df['CHRONIC'].map({'0':False,'1':True})
+
+            return df
         
     class ICD9_CM_Chapters:
         """

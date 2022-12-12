@@ -89,14 +89,21 @@ class ICDCodesGrouper(object):
 
             def batch_lookup(codes : pd.Series):
                 
-                mask_is_alpha = codes.apply(lambda x: (x[0] == 'E') | (x[0] == 'V'))
-                codes_char = (codes
+                
+                mask_is_na = codes.isna()
+                codes_na = codes.loc[mask_is_na]
+                codes_not_na = codes.loc[~mask_is_na]
+                
+                
+                mask_is_alpha = codes_not_na.apply(lambda x: (x[0] == 'E') | (x[0] == 'V'))
+                codes_char = (codes_not_na
                               .loc[mask_is_alpha]
                               .copy()
                               .apply(lambda x:x[0]) # only need first character to identify chapter
                              )
-                codes_num = (codes
-                             .loc[~codes.index.isin(codes_char.index)]
+                
+                codes_num = (codes_not_na
+                             .loc[~codes_not_na.index.isin(codes_char.index)]
                              .copy()
                              .apply(lambda x: x[:3]) # only need first 3 characters to identify chapter
                              .astype(int)
@@ -110,7 +117,9 @@ class ICDCodesGrouper(object):
                 
                 
                 char_chapters = codes_char.apply(single_lookup)
-                result = (pd.concat([num_chapters,char_chapters],axis='rows') # merge chapters of numerical & alpha codes
+                
+                na_chapters = pd.Series(np.nan,index=codes_na.index)
+                result = (pd.concat([num_chapters,char_chapters,na_chapters],axis='rows') # merge chapters of numerical & alpha codes
                           .loc[codes.index] # get original order
                          )
                 return result

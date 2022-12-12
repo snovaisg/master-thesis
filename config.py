@@ -4,6 +4,9 @@ from pydantic import BaseSettings
 class Settings(BaseSettings):
     
     mimic_path: str = 'Define me in .env'
+    mimic_iii_path: str = 'Define me in .env'
+    mimic_iv_ed_path: str = 'Define me in .env'
+    mimic_iv_path: str = 'Define me in .env'
     ccs_path : str = 'Define me in .env'
     icd9_chapter_path : str = 'Define me in .env'
     random_seed : int = 'Define me in .env'
