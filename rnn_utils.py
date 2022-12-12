@@ -5,12 +5,17 @@ import matplotlib.pyplot as plt
 
 from torch.utils.data import Dataset, DataLoader, random_split, SubsetRandomSampler
 from torch import nn
+from torch.nn import ReLU,Linear,Module, Sigmoid
 import torch
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence, pack_sequence
 import torch.nn.functional as F
 
+from scipy.stats import skew as compute_skew
+from scipy.stats import kurtosis as compute_kurtosis
 
-from sklearn.model_selection import ParameterGrid, ParameterSampler
+
+
+from sklearn.model_selection import ParameterGrid, ParameterSampler,StratifiedKFold
 
 from tqdm.notebook import tqdm
 
@@ -24,6 +29,7 @@ import json
 import re
 
 from sklearn.metrics import roc_curve, precision_recall_curve, roc_auc_score, average_precision_score, recall_score, precision_score, f1_score, accuracy_score 
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 from tqdm.auto import tqdm
 
@@ -36,17 +42,25 @@ class ICareDataset(Dataset):
     
     def __init__(self, 
                  diagnoses_file, 
-                 universe_grouping, 
+                 universe_grouping,
+                 input:str, #either history_cumulative or history
+                 target:str, #either target or new_target
                  grouping='ccs', # desired grouping to use (for both input and output currently),
                  train_size:float = 0.70,
                  val_size:float = 0.15,
                  test_size:float = 0.15,
+                 opt_size:float=0.15,
                  shuffle_dataset:bool = True,
                  random_seed :int = 432,
                  partial:int=None # number of patients to process. good for debugging
                 ):
+            
+            
+        self.input = input
+        self.target = target
         
         assert train_size+val_size+test_size == 1, 'Oops'
+        assert opt_size < train_size, 'Oops'
 
         with open(diagnoses_file,'r') as fp:
             self.raw_data = json.load(fp)
@@ -67,29 +81,45 @@ class ICareDataset(Dataset):
         
         print('processing each patient')
         for pat in tqdm(self.patients):
+            pat_data = dict()
             
             history_original = self.raw_data[pat][self.grouping]['history']
+            if self.input == 'history_cumulative':
+                history_cumulative = [[item for sublist in history_original[:i] for item in sublist] for i in range(1,len(history_original)+1)]
+                history_cumulative_mhot = self.adms2multihot(history_cumulative).to(dtype=torch.float)
+                history_cumulative_hot = torch.where(history_cumulative_mhot > 0,1,0).to(dtype=torch.float)
+                pat_data['history_hot'] = history_cumulative_hot
+                pat_data['history_original'] = history_cumulative
+            elif self.input == 'history':
+                history_mhot = self.adms2multihot(history_original).to(dtype=torch.float)
+                history_hot = torch.where(history_mhot > 0,1,0).to(dtype=torch.float)
+                pat_data['history_hot'] = history_hot
+                pat_data['history_original'] = history_original
+            else:
+                raise ValueError()
+            
+                
             target_original = self.raw_data[pat][self.grouping]['targets']
-            new_target_original = self.raw_data[pat][self.grouping]['new_targets']
-
-            history_mhot = self.adms2multihot(history_original).to(dtype=torch.float)
-            target_mhot = self.adms2multihot(target_original).to(dtype=torch.int64)
-            new_target_mhot = self.adms2multihot(new_target_original).to(dtype=torch.int64)
+            
+            if self.target == 'new_target':
+                new_target_original = self.raw_data[pat][self.grouping]['new_targets']
+                new_target_mhot = self.adms2multihot(new_target_original).to(dtype=torch.int64)
+                new_target_hot = torch.where(new_target_mhot>0,1,0).to(dtype=torch.float)
+                pat_data['target_hot'] = new_target_hot
+                pat_data['target_original'] = new_target_original
+            elif self.target == 'target':
+                target_mhot = self.adms2multihot(target_original).to(dtype=torch.int64)
+                target_hot = torch.where(target_mhot>0,1,0).to(dtype=torch.float)
+                pat_data['target_hot'] = target_hot
+                pat_data['target_original'] = target_original
+            else:
+                raise ValueError()
             
             length = len(self.raw_data[pat][self.grouping]['history'])
             
-            self.data[pat] = {'history_original': history_original,
-                              'target_original': target_original,
-                              'new_target_original':new_target_original,
-                              'history_mhot':history_mhot,
-                              'target_mhot':target_mhot,
-                              'new_target_mhot':new_target_mhot,
-                              'history_hot':torch.where(history_mhot > 0,1,0).to(dtype=torch.float),
-                              'target_hot':torch.where(target_mhot>0,1,0).to(dtype=torch.float),
-                              'new_target_hot':torch.where(new_target_mhot>0,1,0).to(dtype=torch.float),
-                              'pid': pat,
-                              'length':length
-                             }
+            pat_data.update({'length':length,'pid':pat})
+            self.data[pat] = pat_data
+            
         
         # train-val-test splits
         dataset_size = len(self.patients)
@@ -100,11 +130,15 @@ class ICareDataset(Dataset):
             np.random.shuffle(indices)
             
         train_split = int(np.floor(train_size * dataset_size))
-        val_split = int(np.floor(val_size * dataset_size))
+        val_split = int(np.floor(    val_size * dataset_size))
+        test_split = int(np.floor(  test_size * dataset_size))
+        opt_split = int(np.floor(  opt_size * dataset_size))
         
         self.train_indices = indices[:train_split]
+        self.train_no_opt_indices = indices[:train_split-opt_split] # train without opt
+        self.opt_indices = indices[train_split-opt_split:train_split]
         self.val_indices = indices[train_split:train_split+val_split]
-        self.test_indices = indices[(train_split+val_split):]
+        self.test_indices = indices[(train_split+val_split):train_split+val_split+test_split]
             
             
     def adms2multihot(self,adms):
@@ -161,20 +195,23 @@ class ICareDataset(Dataset):
         gets original converted from int2code
         """
         patient_data = self.data[self.patients[idx]]
+        return patient_data
 
-
-        return {'history_original': patient_data['history_original'],
-                'target_original': patient_data['target_original'],
-                'new_target_original':patient_data['new_target_original'],
-                'history_hot':patient_data['history_hot'],
-                'target_hot':patient_data['target_hot'],
-                'new_target_hot':patient_data['new_target_hot'],
-                'history_mhot':patient_data['history_mhot'],
-                'target_mhot':patient_data['target_mhot'],
-                'new_target_mhot':patient_data['new_target_mhot'],
-                'pid': patient_data['pid'],
-                'length':patient_data['length']
-               }
+        #return {'history_original': patient_data['history_original'],
+        #        'history_cumulative': patient_data['history_cumulative'],
+        #        'target_original': patient_data['target_original'],
+        #        'new_target_original':patient_data['new_target_original'],
+        #        'history_hot':patient_data['history_hot'],
+        #        'history_cumulative_hot':patient_data['history_cumulative_hot'],
+        #        'target_hot':patient_data['target_hot'],
+        #        'new_target_hot':patient_data['new_target_hot'],
+        #        'history_mhot':patient_data['history_mhot'],
+        #        'history_cumulative_mhot':patient_data['history_cumulative_mhot'],
+        #        'target_mhot':patient_data['target_mhot'],
+        #        'new_target_mhot':patient_data['new_target_mhot'],
+        #        'pid': patient_data['pid'],
+        #        'length':patient_data['length']
+        #       }
     
     
     
@@ -192,27 +229,32 @@ class ICareCOLLATE:
     And outputs a pack of train and pad of test sequences
     """
     
-    def __init__(self,input,output):
-        self.POSSIBLE_INPUTS = ['history_hot','history_mhot']
-        self.POSSIBLE_OUTPUTS = ['target_hot','new_target_hot']
+    def __init__(self):
+        #self.POSSIBLE_INPUTS = ['history_hot','history_mhot','history_cumulative_hot','history_cumulative_mhot']
+        #self.POSSIBLE_OUTPUTS = ['target_hot','new_target_hot']
         
-        assert input in self.POSSIBLE_INPUTS, f"input chosen doesn't exist. choose one of the following {self.POSSIBLE_INPUTS}"
+        #assert input in self.POSSIBLE_INPUTS, f"input chosen doesn't exist. choose one of the following {str(self.POSSIBLE_INPUTS)}"
         
-        assert output in self.POSSIBLE_OUTPUTS, f"output chosen doesn't exist. choose one of the following {self.POSSIBLE_OUTPUT}"
+        #assert output in self.POSSIBLE_OUTPUTS, f"output chosen doesn't exist. choose one of the following {str(self.POSSIBLE_OUTPUT)}"
+        #self.OTIMIZE = ['pid','length','history_original','target_original',input,output]
         
-        self.input = input
-        self.output = output
+        #self.input = input
+        #self.output = output
+        #self.optimize = optimize
+        pass
     
     def __call__(self,batch):
         
         result = {field:[pat[field] for pat in batch] for field in batch[0].keys()}
-        
+
         result.update(
             dict(
-                input_pack=pack_sequence(result[self.input],enforce_sorted=False),
-                target_sequence=torch.vstack(result[self.output])
+                input_pack=pack_sequence(result['history_hot'],enforce_sorted=False),
+                target_sequence=torch.vstack(result['target_hot'])
             )
         )
+        result.pop('history_hot')
+        result.pop('target_hot')
         
         return result
     
@@ -397,6 +439,144 @@ class RNN(nn.Module):
         logits = self.sigmoid(out)
         return logits
 
+class MLP(Module):
+    """
+    Adapted from https://xuwd11.github.io/Dropout_Tutorial_in_PyTorch/
+    """
+    def __init__(self, input_size,n_labels, hidden_sizes = [150]):
+        super(MLP, self).__init__()
+        
+        self.sigmoid = nn.Sigmoid()
+        
+        self.model = nn.Sequential()
+        
+        self.model.add_module(f"hidden0", nn.Linear(input_size,hidden_sizes[0]))
+        self.model.add_module(f"act_hidden0",nn.ReLU())
+        
+        for idx,hidden_size in enumerate(hidden_sizes[1:]):
+            self.model.add_module(f"hidden{idx+1}", nn.Linear(hidden_sizes[idx],hidden_size))
+            self.model.add_module(f"act_hidden{idx+1}",nn.ReLU())
+        
+        self.model.add_module(f"final",nn.Linear(hidden_sizes[-1],n_labels))
+        
+    def forward(self, input, ignore_sigmoid=False):
+        
+        
+        #linear layers don't support packs
+        X = pad_packed_sequence(input,batch_first=True)[0]
+        
+        outs = self.model(X)
+
+        if ignore_sigmoid:
+            return outs
+        else:
+            return self.sigmoid(outs)
+        
+
+class MyDropout(nn.Module):
+    """
+    Adapted from https://xuwd11.github.io/Dropout_Tutorial_in_PyTorch/
+    """
+    def __init__(self, p=0.5):
+        super(MyDropout, self).__init__()
+        self.p = p
+        # multiplier is 1/(1-p). Set multiplier to 0 when p=1 to avoid error...
+        if self.p < 1:
+            self.multiplier_ = 1.0 / (1.0-p)
+        else:
+            self.multiplier_ = 0.0
+    def forward(self, input):
+        # if model.eval(), don't apply dropout
+        if not self.training:
+            return input
+        
+        # So that we have `input.shape` numbers of Bernoulli(1-p) samples
+        selected_ = torch.Tensor(input.shape).uniform_(0,1)>self.p
+        selected_.requires_grad = False
+            
+        # Multiply output by multiplier as described in the paper [1]
+        return torch.mul(selected_,input) * self.multiplier_
+
+class MLP_MC(Module):
+    def __init__(self, input_size,n_labels,hidden_sizes = [150],drop_rates=[0., 0.]):
+        """
+        Adapted from https://xuwd11.github.io/Dropout_Tutorial_in_PyTorch/
+        
+        drop_rates : list
+            First position is dropout applied to the input
+            Second position is dropout applied to all the hidden units of the module
+        """
+        
+        super(MLP_MC, self).__init__()
+        
+        self.sigmoid = nn.Sigmoid()
+        
+        self.model = nn.Sequential()
+        
+        self.model.add_module("dropout_input",MyDropout(drop_rates[0]))
+        self.model.add_module("hidden0", nn.Linear(input_size,hidden_sizes[0]))
+        self.model.add_module("act_hidden0",nn.ReLU())
+        
+        for idx,hidden_size in enumerate(hidden_sizes[1:]):
+            
+            self.model.add_module(f"dropout_hidden{idx}", MyDropout(drop_rates[1]))
+            self.model.add_module(f"hidden{idx+1}",nn.Linear(hidden_sizes[idx],hidden_size))
+            self.model.add_module(f"act_hidden{idx+1}",nn.ReLU())
+        
+        self.model.add_module(f"dropout_final", MyDropout(drop_rates[1]))
+        self.model.add_module(f"final",nn.Linear(hidden_sizes[-1],n_labels))
+        
+    def forward(self, input, ignore_sigmoid=False):
+        
+        
+        #linear layers don't support packs
+        X = pad_packed_sequence(input,batch_first=True)[0]
+        
+        outs = self.model(X)
+
+        if ignore_sigmoid:
+            return outs
+        else:
+            return self.sigmoid(outs)
+
+class MeanPredictive(Module):
+    """
+    Meant to be used after a dropout model.
+    The forward of this class implements several forward passes and returns the mean
+    """
+    def __init__(self, model,T):
+        super(MeanPredictive, self).__init__()
+        
+        self.model = model
+        self.T = T # nº forward passes
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, input, ignore_sigmoid=False):
+        self.model.train()
+
+        res = list()
+        for t in range(self.T):
+            logits = self.model(input)
+            res.append(logits)
+        assert torch.any(res[0] != res[1]), 'oops, dropout is not active'
+        res = torch.stack(res).mean(axis=0)
+        if ignore_sigmoid:
+            return res
+        return self.sigmoid(res)
+        
+class DumbClassifier(BaseEstimator, ClassifierMixin):
+
+    def __init__(self):
+        pass
+    def fit(self, X, y):
+        return self
+
+    def predict(self, X):
+        y = np.zeros(shape=(X.shape[0],),dtype=int)
+        return y
+    def predict_proba(self,X):
+        
+        return np.zeros(shape=(X.shape[0],2),dtype=float)
 
 #############################################################
 ######################### DL UTILS ##########################
@@ -407,13 +587,14 @@ class MaskTimesteps():
     """
     creates masks above|below|equal to a position, for stacked sequences with variable sized lengths.
     
-    
+    # single sequence
     when length = [5] and level = 3
     
     if mode == 'below' returns [0,1,2]
     if mode == 'above' returns [2,3,4]
     if mode == 'equal' returns [2]
     
+    # batch of sequences
     when length = [5,2,3] and level = 3
     
     if mode == 'below' returns [0,1,2,5,6,7,8,9] #note: jumps from 2 to 5 because it moved on to sequence 2 which starts at position 5.
@@ -421,10 +602,19 @@ class MaskTimesteps():
     if mode == 'equal' returns [2,9]
     """
     
-    def __init__(self,mode,k):
-        assert mode in ['above','below','equal'], 'Oops'
+    def __init__(self,mode,k=None):
+        assert mode in ['above','below','equal','last','all'], 'Oops'
         self.mode = mode
         self.k = k
+        
+        # if mode != 'last' or 'all', then k has to be specified
+        if mode not in ['last','all']:
+            assert k is not None, 'Must specify k'
+        
+        if mode not in ['last','all']:
+            self.name = self.mode + '_' + str(self.k)
+        else:
+            self.name = self.mode
       
     def __call__(self,lengths):
         selection_idx = []
@@ -439,7 +629,11 @@ class MaskTimesteps():
                     selection_idx.append(start_pos+l)
             elif self.mode == 'equal':
                 if self.k <= length:
-                    selection_idx.append(start_pos+level-1)
+                    selection_idx.append(start_pos+self.k-1)
+            elif self.mode == 'last':
+                selection_idx.append(start_pos+length-1)
+        if self.mode == 'all':
+            selection_idx = list(range(sum(lengths)))
         return selection_idx
                 
     
@@ -510,30 +704,39 @@ def compute_loss_dataloader(model, dataloader, criterion,timestep_selector:Calla
         
     model.eval()
     loss = list()
+    all_nseqs = list()
     
     print('Starting to compute the loss on the dataloader')
     with torch.no_grad():
-        for i, batch in tqdm(enumerate(dataloader)):
-            batch_loss = compute_loss_batch(model, batch, criterion,timestep_selector).item()
-            loss.append(batch_loss)
+        for batch in tqdm(dataloader):
+            batch_loss = compute_loss_batch(model, batch, criterion,timestep_selector)
+            if batch_loss is not None:
+                loss.append(batch_loss.item())
         
-    return np.mean(loss) # not true weighted loss but works
+    return np.mean(loss)
                 
                 
-def compute_loss_batch(model,batch,criterion,timestep_selector:Callable=None):
+def compute_loss_batch(model,batch,criterion,timestep_selector:Callable=None,ignore_empty_targets=False):
     """
     Computes the loss (sum) of a batch. 
     Ignores padded_positions to obtain a more correct loss.
+    timestep_selector may also ignore some sequences.
     
     Parameters
     ----------
     
-    reduction : str | either 'mean' or 'sum'
-        reduction of loss.
+        
+        
+    Returns
+    ----------
+    
+    loss : irreductible loss of the model
+    
+    n_seqs: number of sequences eligible in this batch to compute the loss.
     """
     
     lengths = batch['length']
-    n_labels = batch['history_mhot'][0].shape[-1]
+    targets = batch['target_sequence']
     
     outs = model(batch['input_pack'],ignore_sigmoid=True)
     
@@ -541,11 +744,53 @@ def compute_loss_batch(model,batch,criterion,timestep_selector:Callable=None):
     
     if timestep_selector is not None:
         mask = timestep_selector(lengths)
-        non_padded_outs = non_padded_outs[mask,:]
+        nseqs = len(mask)
+        if mask:
+            non_padded_outs = non_padded_outs[mask,:]
+            targets = targets[mask,:]
+        else: # no eligible sequences so no loss
+            return None
+        
+    if ignore_empty_targets:
+        non_empty_target_sequences = torch.where(targets.sum(axis=1) > 0)[0]
+        non_padded_outs = non_padded_outs[non_empty_target_sequences,:]
+        targets = targets[non_empty_target_sequences,:]
     
-    loss = criterion(non_padded_outs,batch['target_sequence'])
-    
-    return loss
+    if torch.numel(non_padded_outs) > 0:
+        loss = criterion(non_padded_outs,targets)
+        return loss
+    return None
+
+
+def compute_loss_decomposed(model,dataloader,criterion):
+    loss_positives = list()
+    loss_negatives = list()
+    loss = list()
+    print('Iterating dataloader to compute decomposed loss')
+    for batch in tqdm(dataloader):
+
+        lengths = batch['length']
+        input = batch['input_pack']
+        targets = batch['target_sequence']
+
+        outs = model(input,ignore_sigmoid=True)
+        outs = outs2nonpadded(outs,lengths)
+
+        idx_positives = torch.where(targets.sum(axis=1) > 0)[0]
+        outs_positives = outs[idx_positives,:]
+        targets_positives = targets[idx_positives,:]
+        loss_positives.append(criterion(outs_positives,targets_positives).item())
+
+        idx_negatives = torch.where(targets.sum(axis=1) == 0)[0]
+        outs_negatives = outs[idx_negatives,:]
+        targets_negatives = targets[idx_negatives,:]
+        loss_negatives.append(criterion(outs_negatives,targets_negatives).item())
+
+        loss.append(criterion(outs,targets).item())
+    return {'loss':np.nanmean(loss),
+            'loss_positives':np.nanmean(loss_positives),
+            'loss_negatives':np.nanmean(loss_negatives)
+           }
 
 def outs2nonpadded(outs,lengths):
     """
@@ -576,7 +821,7 @@ def outs2nonpadded(outs,lengths):
     return outs.view(-1,outs.shape[-1])[non_padded_positions,:]
 
 
-def train_model_batch(model,batch,criterion,optimizer,timestep_selector:Callable=None):
+def train_model_batch(model,batch,criterion,optimizer,timestep_selector:Callable=None,ignore_empty_targets=False):
     """
     Receives a model and a batch of input and labels.
     Trains a model on this data and returns the loss.
@@ -587,57 +832,60 @@ def train_model_batch(model,batch,criterion,optimizer,timestep_selector:Callable
     # zero the parameter gradients
     model.zero_grad()
 
-    loss = compute_loss_batch(model,batch,criterion,timestep_selector)
+    loss = compute_loss_batch(model,batch,criterion,timestep_selector,ignore_empty_targets)
+    if loss is not None: # timestep selector may return zero, making it impossible to compute loss on this batch
 
-    loss.backward()
+        loss.backward()
 
-    optimizer.step()
+        optimizer.step()
     
-    return loss.item()
+        return loss.item()
+    
+    return None
 
 
-def train_model_dataloader(model, dataloader, criterion, optimizer,timestep_selector:Callable=None):
+def train_model_dataloader(model, dataloader, criterion, optimizer,timestep_selector:Callable=None,ignore_empty_targets=False):
     
     model.train()
     
     print('Starting to train each batch')
-    losses = list()
-    for i, batch in tqdm(enumerate(dataloader)):
+    loss = list()
+    
+    for batch in tqdm(dataloader):
         
-        batch_loss = train_model_batch(model,batch,criterion,optimizer,timestep_selector)
+        batch_loss = train_model_batch(model,batch,criterion,optimizer,timestep_selector,ignore_empty_targets)
+        if batch_loss is not None:
+            loss.append(batch_loss)
         
-        losses.append(batch_loss)
-        
-    # last batch prob has different size so the mean isn't true weighted mean. but shouldn't affect too much
-    dataloader_loss = np.mean(losses) 
-    return dataloader_loss
+    return np.nanmean(loss)
 
 
 def compute_model_logits_batch(model,batch,timestep_selector:Callable=None):
     
     lengths = batch['length']
     logits = model(batch['input_pack'])
+    logits = outs2nonpadded(logits,lengths)
     
     if timestep_selector is not None:
         mask = timestep_selector(lengths)
         logits = logits[mask,:]
     
-    non_padded_logits = outs2nonpadded(logits,batch['length'])
-    
-    return non_padded_logits
+    return logits
 
-def compute_model_preds_batch(model,batch,thresholds : dict,timestep_selector:Callable=None):
+def compute_model_preds_batch(model,batch,thresholds : dict,topk=None,timestep_selector:Callable=None):
     
     lengths = batch['length']
     logits = compute_model_logits_batch(model,batch,timestep_selector)
     
-    preds = logits2preds(logits,thresholds)
+    preds = logits2preds(logits,thresholds,topk)
     
     return preds
 
-def logits2preds(logits,thresholds : dict):
+
+def logits2preds(logits,thresholds : dict,topk:int=None):
     """
-    computes predictions given some logits and decision thresholds
+    If topk is specifided, uses topk logits for predictions.
+    Otherwise computes predictions given decision thresholds
     
     Parameters
     logits : torch.tensor, shape= (n_examples, n_labels), or shape=(batch_size,max_seq_length,n_labels)
@@ -645,16 +893,115 @@ def logits2preds(logits,thresholds : dict):
     thresholds : dict, example {0:0.5, 1:0.43, 2:0.57, ...} (one for each diagnostic)
     """
     
-    assert len(thresholds) == logits.shape[-1], "Last dimension must match. It's supposed to be the universe of diagnostics"
-    
-    # create thresholds matrix with the same shape as logits
-    ths = torch.tensor([thresholds[diag] for diag in range(len(thresholds))]).expand(logits.shape)
-    
-    # computes preds
-    preds = torch.where(logits > ths,1,0)
+    if topk is not None:
+        sorted_idx = torch.argsort(logits,descending=True)[:,:topk]
+        preds = F.one_hot(sorted_idx,num_classes=logits.shape[-1]).sum(axis=1)
+    else:
+        assert len(thresholds) == logits.shape[-1], "Last dimension must match. It's supposed to be the universe of diagnostics"
+
+        # create thresholds matrix with the same shape as logits
+        ths = torch.tensor([thresholds[diag] for diag in range(len(thresholds))]).expand(logits.shape)
+
+        # computes preds
+        preds = torch.where(logits > ths,1,0)
     
     return preds
         
+    
+##########################################################################
+########################## POSTERIOR PREDICTIVE ##########################
+##########################################################################
+    
+    
+def compute_model_predictive_samples_batch(model,batch,timestep_selector,T:int=25):
+    model.train() #activate dropout
+    res = []
+    for t in range(T):
+        logits = compute_model_logits_batch(model,batch,timestep_selector)
+        res.append(logits)
+    return torch.stack(res) # first dimension is each forward pass of the batch
+
+def compute_model_predictive_logits_batch(model,batch,timestep_selector,T):
+    
+    logits_T = compute_model_predictive_samples_batch(model,batch,timestep_selector,T)
+    # predictions are the mean of the forward passes
+    logits = torch.mean(logits_T,axis=0)
+    return logits
+
+def compute_predictive_stats(logits_T):
+    """
+    logits: shape=(N_passes,sequences_batch,n_labels)
+    """
+    mean = torch.mean(logits_T,axis=0)
+    median = torch.quantile(logits_T,q=0.5,dim=0)
+    quart1 = torch.quantile(logits_T,q=0.25,dim=0)
+    quart3 = torch.quantile(logits_T,q=0.75,dim=0)
+    var = torch.var(logits_T,axis=0)
+    std = torch.sqrt(var)
+    skew = 3 * (mean - median) / std
+    stats = torch.stack([mean,quart1,median,quart3,var,std,skew],dim=1)
+    return dict(stats=stats,stats_names=['mean','q25','median','q75','var','std','skew'])
+
+def compute_predictive_stats_V3(logits_T):
+    """
+    logits: shape=(N_passes,sequences_batch,n_labels)
+    """
+    
+    #std = torch.sqrt(torch.var(logits_T,axis=0))
+    mean = torch.mean(logits_T,axis=0)
+    
+    median = torch.quantile(logits_T,q=0.5,dim=0)
+    quant10 = torch.quantile(logits_T,q=0.10,dim=0)
+    #quant25 = torch.quantile(logits_T,q=0.25,dim=0)
+    #quant75 = torch.quantile(logits_T,q=0.75,dim=0)
+    quant90 = torch.quantile(logits_T,q=0.90,dim=0)
+    skew = torch.Tensor(compute_skew(logits_T.detach(),axis=0))
+    kurtosis = torch.Tensor(compute_kurtosis(logits_T.detach(),axis=0))
+    
+    #q50_10 = median - quant10
+    #q50_25 = median - quant25
+    #q50_75 = quant75 - median
+    q50_90 = quant90 - median
+    #stats = torch.stack([mean,median,std,quant10,quant25,quant75,quant90,skew,kurtosis,q50_10,q50_25,q50_75,q50_90],dim=1)
+    stats = torch.stack([mean,skew,kurtosis,q50_90],dim=1)
+    return dict(stats=stats,stats_names=['mean','skew','kurtosis','iqd_50_90'])
+
+def compute_predictive_stats_V2(logits_T):
+    """
+    logits: shape=(N_passes,sequences_batch,n_labels)
+    """
+    
+    std = torch.sqrt(torch.var(logits_T,axis=0))
+    mean = torch.mean(logits_T,axis=0)
+    
+    median = torch.quantile(logits_T,q=0.5,dim=0)
+    quant10 = torch.quantile(logits_T,q=0.10,dim=0)
+    quant25 = torch.quantile(logits_T,q=0.25,dim=0)
+    quant75 = torch.quantile(logits_T,q=0.75,dim=0)
+    quant90 = torch.quantile(logits_T,q=0.90,dim=0)
+    skew = torch.Tensor(compute_skew(logits_T.detach(),axis=0))
+    kurtosis = torch.Tensor(compute_kurtosis(logits_T.detach(),axis=0))
+    
+    q50_10 = median - quant10
+    q50_25 = median - quant25
+    q50_75 = quant75 - median
+    q50_90 = quant90 - median
+    stats = torch.stack([mean,median,std,quant10,quant25,quant75,quant90,skew,kurtosis,q50_10,q50_25,q50_75,q50_90],dim=1)
+    return dict(stats=stats,stats_names=['mean','median','std','q10','q25','q75','q90','skew','kurtosis','iqd_50_10','iqd_50_25','iqd_50_75','iqd_50_90'])
+    
+def compute_model_predictive_stats_dataloader(model,dataloader,timestep_selector,T:int = 25):
+    all_stats = list()
+    all_targets = list()
+    print('Starting to iterate dataloader to compute predictive distribution statistics')
+    for batch in tqdm(dataloader):
+        logits_T = compute_model_logits_batch_T(model,batch,None,T)
+        all_stats.append(compute_predictive_stats(logits_T))
+        all_targets.append(batch['target_sequence'])
+    stats_names = all_stats[0].keys()
+    all_stats = torch.stack([torch.vstack([e[key] for e in all_stats]) for key in all_stats[0].keys()]).detach().numpy()
+    all_targets = torch.vstack(all_targets).detach().numpy()
+    return dict(stats_names=stats_names,all_stats=all_stats,all_targets=all_targets)
+
 #############################################################
 ########################## METRICS ##########################
 #############################################################
@@ -715,8 +1062,127 @@ class Metrics:
                        }
         return res
     
+    
+class MetricsV2:
+    """
+    Wrapper for torchmetrics that implements the basic functions (update and compute) but for several multilabel metrics (without average!)
+    
+    Accepts a dictionary like: {metric_name:torch.metric, metric_name:torch.metric, ...} 
+    """
+    
+    def __init__(self,metrics_factory : dict, timestep_selectors : list = [MaskTimesteps('all')]):
+        
+        self.metrics_factory = metrics_factory
+        self.timestep_selectors = timestep_selectors
+        self.selectors = timestep_selectors
+        self.n_labels = None
+        
+        self.metrics = self._build_metrics()
+        self.stats = self._build_stats_for_selectors(self.timestep_selectors)
+    
+    def reset_metrics(self):
+        self.metrics = self._build_metrics()
+        self.stats = self._build_stats_for_selectors(self.timestep_selectors)
+        
+    def update_metrics_dataloader(self,model,dataloader,thresholds):
+        print('Starting to iterate dataloader to update metrics')
+        for batch in tqdm(dataloader):
+            self.update_metrics_batch(model,batch,thresholds)
+        return
+        
+    def update_metrics_batch(self,model,batch,thresholds : dict,topk=None):
+        
+        self._update_stats_batch(batch)
+        
+        targets = batch['target_sequence']
+        lengths = batch['length']
+        
+        for selector in self.selectors:
+            logits = compute_model_logits_batch(model,batch,selector)
+            preds = logits2preds(logits,thresholds,topk)
+            
+            mask = selector(lengths)
+            selected_target = targets[mask,:].int()
+            
+            for metric_name in self.metrics:
+                if 'roc' in metric_name or 'avgprec' in metric_name or "@" in metric_name:
+                    self.metrics[metric_name][selector.name]['meta']['metric'].update(logits,selected_target)
+                else:
+                    print(preds.shape)
+                    print(logits.shape)
+                    print(preds)
+                    print(preds.sum(axis=-1))
+                    self.metrics[metric_name][selector.name]['meta']['metric'].update(preds,selected_target)
+        return
+    
+    def compute_metrics(self):
+        for metric_name in self.metrics:
+            for selector_name in self.metrics[metric_name]:
+                result = self.metrics[metric_name][selector_name]['meta']['metric'].compute()
+                self.metrics[metric_name][selector_name]['results']['original'] = result
+                
+                for extra_pool in self.metrics[metric_name][selector_name]['meta']['extra_pooling']:
+                    if extra_pool == 'weighted':
+                        weighted_result = sum([torch.nan_to_num(value,0)*self.stats[selector_name]['positives'][label]/self.stats[selector_name]['all_positives'] for label,value in enumerate(result)])
+                        self.metrics[metric_name][selector_name]['results'][extra_pool] = weighted_result.item()
+                    else:
+                        print(f"Don't recognize extra_pool: ",extra_pool)
+        return self.show_metrics()
+    
+    def show_metrics(self):
+        res = {}
+        for metric_name in self.metrics:
+            res[metric_name] = dict()
+            for selector_name in self.metrics[metric_name]:
+                res[metric_name][selector_name] = dict()
+                for result_type in self.metrics[metric_name][selector_name]['results']:
+                    res[metric_name][selector_name][result_type] = self.metrics[metric_name][selector_name]['results'][result_type]
+        return res
+        
+        
+        
+    def _build_metrics(self):
+        metrics = {}
+        for metric in self.metrics_factory:
+            func = self.metrics_factory[metric]['func']
+            kwargs = self.metrics_factory[metric]['kwargs']
+            
+            metrics[metric] = dict()
+            for selector in self.timestep_selectors:
+                metrics[metric][selector.name] = {'meta':dict(metric=func(**kwargs),
+                                                               selector=selector,
+                                                              extra_pooling=self.metrics_factory[metric]['extra_pooling']
+                                                              ),
+                                                  'results':dict()
+                                                 }
+        return metrics
+    
+    def _build_stats_for_selectors(self,selectors):
+        """
+        Counting the positives helps perform weight averages
+        """
+        stats = dict()
+        for selector in selectors:
+            stats[selector.name] = dict(positives=None,all_positives=0)
+        return stats
+    
+    def _update_stats_batch(self,batch):
+        
+        for selector in self.selectors:
+            positives_each = compute_positives_batch(batch,how='each',timestep_selector=selector)
 
-def compute_metrics_dataloader(metrics, model, dataloader, thresholds: dict,timestep_selector:Callable=None):
+            if self.n_labels is None:
+                self.n_labels = batch['target_sequence'].shape[-1]
+            if self.stats[selector.name]['positives'] is None:
+                self.stats[selector.name]['positives'] = {label:0 for label in range(self.n_labels)}
+            
+            for label in positives_each:
+                self.stats[selector.name]['positives'][label] += positives_each[label]
+            self.stats[selector.name]['all_positives'] = sum(self.stats[selector.name]['positives'].values())
+        return 
+    
+
+def compute_metrics_dataloader(metrics, model, dataloader, thresholds: dict,topk=None,timestep_selector:Callable=None):
     """
     
     Parameters
@@ -737,17 +1203,20 @@ def compute_metrics_dataloader(metrics, model, dataloader, thresholds: dict,time
             
             if timestep_selector is not None:
                 eligible_timesteps = timestep_selector(lengths)
+                if eligible_timesteps:
                 
-                logits = logits[eligible_timesteps,:]
-                targets = targets[eligible_timesteps,:]
+                    logits = logits[eligible_timesteps,:]
+                    targets = targets[eligible_timesteps,:]
+                else:
+                    continue
             
-            preds = logits2preds(logits,thresholds)
+            preds = logits2preds(logits,thresholds,topk)
             metrics.update(logits,preds,targets)
 
     print('Now its time to compute metrics. this may take a while')
     return metrics.compute()
 
-def compute_metrics_batch(metrics: dict, model, batch, thresholds : dict):
+def compute_metrics_batch(metrics: dict, model, batch, thresholds : dict,topk=None):
     """
     Returns metrics of a batch. By default returns the sum over records (and you can average it later). But you can set average=True.
     
@@ -757,18 +1226,299 @@ def compute_metrics_batch(metrics: dict, model, batch, thresholds : dict):
     """
     
     logits = compute_model_logits_batch(model,batch)
-    preds = logits2preds(logits,thresholds)
+    preds = logits2preds(logits,thresholds,topk)
     
 
     metrics.update(logits=logits,preds=preds,target=batch['target_sequence'])
     
     return metrics.compute()
 
+
+##################################################################
+########################### TPFP dataset ########################
+##################################################################
+
+def build_tp_fp_dataset(mc_model,dataloader,thresholds,topk,stats_fun):
+    
+    n_labels = next(iter(dataloader))['target_sequence'].shape[-1]
+    dataset_tp_fp = {diag:{'features':list(),'target':list()} for diag in range(n_labels)}
+    feature_names = None
+    
+    print('Iterating the dataloader to produce the TP/FP dataset')
+    for batch in tqdm(dataloader):
+
+        # compute logits and stats of the posterior predictive
+        logits_T = compute_model_predictive_samples_batch(mc_model,batch,MaskTimesteps('all'),T=25)
+        predictive_stats = stats_fun(logits_T)
+
+        # get the mean of logits
+        mean_pos = predictive_stats['stats_names'].index('mean')
+        mean_logits = predictive_stats['stats'][:,mean_pos,:]
+        
+        # save feature names
+        if feature_names is None:
+            feature_names = predictive_stats['stats_names']
+
+        # get top30 logits as predictions
+        preds = logits2preds(mean_logits,thresholds,topk)
+
+        # get labels
+        P = preds == 1 # Positives
+        TP = P & (batch['target_sequence'] == 1) # True positives (target)
+
+        # save only datapoints from positives
+        for diag in range(logits_T.shape[-1]):
+            dataset_tp_fp[diag]['features'].append(predictive_stats['stats'][P[:,diag],:,diag].type(torch.float16))
+            dataset_tp_fp[diag]['target'].append(TP[P[:,diag],diag].int().view(-1,).type(torch.int8))
+
+    for diag in dataset_tp_fp:
+        dataset_tp_fp[diag]['features'] = torch.vstack(dataset_tp_fp[diag]['features']).detach().numpy()
+        dataset_tp_fp[diag]['target'] = torch.hstack(dataset_tp_fp[diag]['target']).detach().numpy()
+        dataset_tp_fp[diag]['feature_names'] = feature_names
+        
+    dataset_tp_fp[diag]['positive_class'] = 'True Positives' # for reference
+    return dataset_tp_fp
+
+
+def build_tp_fp_statistics(dataset_tp_fp):
+    """
+    Given a TPFP dataset, computes the following statistics: 
+    size, n_positives, pos_prevalence (positive prevalence).
+    Also computes the average precision when using just the mean as the final logit.
+    And computes the avg prec in different splits to test stability.
+    
+    Parameters
+    ----------
+    dataset_tp_fp : dict, keys= {<diag>:{'features':np.ndarray,'target':np.ndarray}}
+    
+    Returns
+    -------
+    None (adds the additional statistics to the dictionary that was passed as input)
+    """
+    
+    n_splits = 3
+    splitter = StratifiedKFold(n_splits=n_splits,shuffle=True)
+    
+    print('Starting to iterate TPFP dataset to compute statistics and original average precision')
+    for diag in tqdm(dataset_tp_fp):
+        
+        dataset_tp_fp[diag]['size'] = dataset_tp_fp[diag]['target'].shape[0]
+        dataset_tp_fp[diag]['n_positives'] = (dataset_tp_fp[diag]['target']==1).sum()
+        
+        
+
+        if dataset_tp_fp[diag]['size'] == 0:
+            dataset_tp_fp[diag]['pos_prevalence'] = 0
+            dataset_tp_fp[diag]['avgprec'] = dict(original=dict(full=np.nan,mean=np.nan,std=np.nan))
+        else:
+            dataset_tp_fp[diag]['pos_prevalence'] = round(dataset_tp_fp[diag]['n_positives'] / dataset_tp_fp[diag]['size'],5)
+            
+            minority_class = 0 if dataset_tp_fp[diag]['pos_prevalence'] > 0.5 else 1
+            min_req_4_kfold = dataset_tp_fp[diag]['n_positives'] if minority_class == 1 else dataset_tp_fp[diag]['size'] - dataset_tp_fp[diag]['n_positives']
+            
+            # copute average precision of original logits (aka: when the mean of the posterior is the final logit)
+            full_avgprec = np.nan
+            if dataset_tp_fp[diag]['pos_prevalence'] != 0:
+                full_avgprec = average_precision_score(dataset_tp_fp[diag]['target'],
+                                                       dataset_tp_fp[diag]['features'][:,0]
+                                                      )
+            if np.isnan(full_avgprec): # sometimes we get a nan that is a np.float and messes up checks later on
+                full_avgprec = np.nan
+                
+            # now compute at different folds to test stability
+            scores_original = list()
+            if (min_req_4_kfold > n_splits) and full_avgprec is not np.nan:
+                for train_idx,val_idx in splitter.split(dataset_tp_fp[diag]['features'],dataset_tp_fp[diag]['target']):
+                    scores_original.append(average_precision_score(dataset_tp_fp[diag]['target'][val_idx],
+                                                                   dataset_tp_fp[diag]['features'][val_idx,0])
+                                          )
+            mean_avgprec_original = np.nan
+            std_avgprec_original = np.nan
+            
+            if scores_original:
+                mean_avgprec_original = np.mean(scores_original)
+                std_avgprec_original = np.std(scores_original)
+            
+            dataset_tp_fp[diag]['avgprec'] = {'original': dict(full=full_avgprec,
+                                                               mean=mean_avgprec_original,
+                                                               std=std_avgprec_original
+                                                              )
+                                             }
+
+def train_tpfp_models(dataset_tp_fp):
+    n_splits = 3
+    corr_threshold = 0.8
+    
+    print('Starting to iterate tpfp dataset to train Logistic Regressions')
+    for diag in tqdm(dataset_tp_fp):
+        dataset_tp_fp[diag]['correlation'] = dict()
+
+
+        if dataset_tp_fp[diag]['pos_prevalence'] in [np.nan,0,1] or dataset_tp_fp[diag]['size'] < 30:
+            # not enough data to create model
+            pipeline = np.nan
+            mean_avgprec = np.nan
+            std_avgprec = np.nan
+            full_avgprec = np.nan
+        else:
+            X = dataset_tp_fp[diag]['features']
+            y = dataset_tp_fp[diag]['target']
+
+            linear_correlations = eval_linear_correlations(X,corr_threshold)
+            dataset_tp_fp[diag]['correlation']['to_drop'] = [dataset_tp_fp[diag]['feature_names'][i] for i in linear_correlations['to_drop']]
+            dataset_tp_fp[diag]['correlation']['to_keep'] = [dataset_tp_fp[diag]['feature_names'][i] for i in linear_correlations['to_keep']]
+            dataset_tp_fp[diag]['correlation']['to_keep_idx'] = linear_correlations['to_keep']
+            
+
+            # drop linearly correlated features
+            features_to_keep = linear_correlations['to_keep']
+            X = X[:,features_to_keep]
+
+            pipeline = make_pipeline(StandardScaler(),LogisticRegression(class_weight='balanced'))
+            scores = cross_val_score(pipeline, X, y, cv=n_splits, scoring='average_precision')
+            mean_avgprec = np.mean(scores)
+            std_avgprec = np.std(scores)
+            
+            pipeline.fit(X,y)
+            
+            logits = pipeline.predict_proba(X)[:,1]
+            full_avgprec = average_precision_score(y,logits)
+            
+
+        dataset_tp_fp[diag]['pipeline'] = pipeline
+        dataset_tp_fp[diag]['avgprec']['model'] = dict(full=full_avgprec,mean=mean_avgprec,std=std_avgprec)
+        
+def eval_tpfp_models(train_dataset_tp_fp,val_dataset_tp_fp):
+    """
+    evalues the pipelines in train_dataset_tp_fp on the dataset val_dataset_tp_fp.
+    Records results in val_dataset_tp_fp.
+    """
+    n_splits = 3
+    print('Starting to iterate dataset to evaluate the LR models on a validation set')
+    for diag in val_dataset_tp_fp:
+        if train_dataset_tp_fp[diag]['pipeline'] is np.nan:
+            avgprec = np.nan
+        else:
+            X = val_dataset_tp_fp[diag]['features']
+            y = val_dataset_tp_fp[diag]['target']
+
+            # drop linearly correlated features
+            features_to_keep = train_dataset_tp_fp[diag]['correlation']['to_keep_idx']
+            X = X[:,features_to_keep]
+
+            pipeline = train_dataset_tp_fp[diag]['pipeline']
+
+            logits = pipeline.predict_proba(X)[:,1]
+            avgprec = average_precision_score(y,logits)
+        val_dataset_tp_fp[diag]['avgprec']['model'] = dict(full=avgprec)
+        
+def train_tpfp_modelsSearchOverfit(train_dataset_tp_fp, val_dataset_tp_fp):
+    n_splits = 3
+    corr_threshold = 0.8
+    
+    Uparams = dict(C=np.linspace(0,1,11)[1:],class_weight=[None,'balanced'])
+    params = ParameterGrid(Uparams)
+    
+    print('Starting to iterate tpfp dataset to train Logistic Regressions')
+    for diag in tqdm(train_dataset_tp_fp):
+        train_dataset_tp_fp[diag]['correlation'] = dict(to_keep=[],to_drop=[],to_keep_idx=[])
+
+
+        if train_dataset_tp_fp[diag]['pos_prevalence'] in [np.nan,0,1] or val_dataset_tp_fp[diag]['pos_prevalence'] in [np.nan,0,1]:# or train_dataset_tp_fp[diag]['size'] < 30:
+            # not enough data to create model
+            pipeline = np.nan
+            avgprec_val = np.nan
+            avgprec_train = np.nan
+            best_param = np.nan
+        else:
+            X_train = train_dataset_tp_fp[diag]['features']
+            y_train = train_dataset_tp_fp[diag]['target']
+            X_val = val_dataset_tp_fp[diag]['features']
+            y_val = val_dataset_tp_fp[diag]['target']
+
+            linear_correlations = eval_linear_correlations(X_train,corr_threshold)
+            train_dataset_tp_fp[diag]['correlation']['to_drop'] = [train_dataset_tp_fp[diag]['feature_names'][i] for i in linear_correlations['to_drop']]
+            train_dataset_tp_fp[diag]['correlation']['to_keep'] = [train_dataset_tp_fp[diag]['feature_names'][i] for i in linear_correlations['to_keep']]
+            train_dataset_tp_fp[diag]['correlation']['to_keep_idx'] = linear_correlations['to_keep']
+            
+
+            # drop linearly correlated features
+            features_to_keep = linear_correlations['to_keep']
+            X_train = X_train[:,features_to_keep]
+            X_val = X_val[:,features_to_keep]
+            
+            best_param = None
+            best_avgprec = None
+            for param in params:
+                pipeline = make_pipeline(StandardScaler(),LogisticRegression(**param))
+                pipeline.fit(X_train,y_train)
+                logits = pipeline.predict_proba(X_val)[:,1]
+                avgprec = average_precision_score(y_val,logits)
+                if best_avgprec is None:
+                    best_avgprec = avgprec
+                    best_param = param
+                elif best_avgprec < avgprec:
+                    best_avgprec = avgprec
+                    best_param = param
+                    
+            # retrain the model with best parameters
+            # and record train and val metrics
+            pipeline = make_pipeline(StandardScaler(),LogisticRegression(**best_param))
+            pipeline.fit(X_train,y_train)
+            logits = pipeline.predict_proba(X_train)[:,1]
+            avgprec_train = average_precision_score(y_train,logits)
+            
+            logits_val = pipeline.predict_proba(X_val)[:,1]
+            avgprec_val = average_precision_score(y_val,logits_val)
+            
+            
+
+        train_dataset_tp_fp[diag]['grid_search_pipeline'] = pipeline
+        train_dataset_tp_fp[diag]['avgprec']['grid_search_model'] = dict(train_score=avgprec_train,
+                                                                   val_score=avgprec_val,
+                                                                   best_params=best_param
+                                                                  )
+        val_dataset_tp_fp[diag]['grid_search_pipeline'] = pipeline
+        val_dataset_tp_fp[diag]['avgprec']['grid_search_model'] = dict(train_score=avgprec_train,
+                                                                   val_score=avgprec_val,
+                                                                   best_params=best_param
+                                                                  )
+        
+def eval_linear_correlations(feature_matrix : np.ndarray, threshold=0.8):
+    """
+    Returns the features with pearson correlation above and below <threshold>
+    
+    
+    Parameters
+    ----------
+    feature_matrix: np.array, shape=(n_datapoints,n_features)
+    
+    threshold : float, 
+        Pearson correlation threshold
+    
+    Returns
+    --------
+    dict -> {'to_drop':<list of indices of features to drop>,
+             'to_keep':<list of indices of features to keep> 
+            } # yeah a bit redundant but helps later on to do some statistics
+    """
+    corr_matrix = np.abs(np.corrcoef(feature_matrix,rowvar=False)).round(4)
+    corr_matrix_upper = np.triu(corr_matrix)
+    corr_matrix_upper = np.where(corr_matrix_upper == 1,0,corr_matrix_upper)
+    to_drop = [column for column in range(len(corr_matrix_upper)) if any(corr_matrix_upper[:,column] > threshold)]
+    to_keep = [c for c in range(len(corr_matrix_upper)) if c not in to_drop]
+    return dict(to_drop=to_drop,to_keep=to_keep)
+
+##################################################################
+########################### THRESHOLDS ###########################
+##################################################################
+
 def compute_thresholds_dataloader(model,dataloader,timestep_selector:Callable=None):
     """
     Computes the best thresholds for a given based on max f1 score on that dataloader
     """
     # load logits and targets into memory
+    print('Starting to compute thresholds')
     
     all_logits = list()
     all_target = list()
@@ -780,6 +1530,8 @@ def compute_thresholds_dataloader(model,dataloader,timestep_selector:Callable=No
         
         if timestep_selector is not None:
             mask = timestep_selector(lengths)
+            if not mask:
+                continue
             logits = logits[mask,:]
             targets = targets[mask,:]
 
@@ -831,11 +1583,164 @@ def compute_thresholds_dataloader(model,dataloader,timestep_selector:Callable=No
             best_thresholds[scoring_fun].append(best_ths)
         all_prevalence.append(prevalence)
         all_positives.append(positives)
+        
 
     return pd.DataFrame(data=[max_scores['f1_score'],best_thresholds['f1_score'],all_prevalence,all_positives],
              index=["f1_score","best_thresholds","all_prevalence","all_positives"]
             ).T
 
+def compute_thresholds_recall_above_topk_dataloader(model,dataloader,topk,timestep_selector:Callable=None):
+    """
+    Computes the best thresholds for a given based on max f1 score on that dataloader
+    """
+    # load logits and targets into memory
+    print('Starting to compute thresholds')
+    
+    all_logits = list()
+    all_target = list()
+    print('Iterating the dataloader to obtain the logits and targets')
+    for batch in tqdm(iter(dataloader)):
+        lengths = batch['length']
+        logits = compute_model_logits_batch(model,batch)
+        targets = batch['target_sequence']
+        
+        if timestep_selector is not None:
+            mask = timestep_selector(lengths)
+            if not mask:
+                continue
+            logits = logits[mask,:]
+            targets = targets[mask,:]
+
+        all_target.append(targets)
+        all_logits.append(logits)
+
+    all_logits = torch.vstack(all_logits)
+    all_target = torch.vstack(all_target)
+    
+    
+    f1score = lambda precision,recall: 2 * precision * recall / (precision + recall)
+    
+    num_elements = all_target.shape[0]
+    
+    res = {}
+    print(f'Computing the thresholds for each of the {all_target.shape[1]} diagnostics')
+    for diag in tqdm(range(all_target.shape[1])):
+        precision, recall, thresholds = precision_recall_curve(all_target.numpy()[:,diag],
+                                                               all_logits.detach().numpy()[:,diag])
+        
+        #print(str(len(recall)) + " "+str(len(thresholds)))
+        #print(len(recall))
+        #print(np.median(recall))
+        #print(np.quantile(recall,0.75))
+        #print('------')
+        positives = all_target[:,diag].sum().item()
+        prevalence = positives / num_elements
+        
+        idx_recall_above_topk = np.where(recall<topk)[0] # recall start at 100% with the lowest threshold.
+        if not idx_recall_above_topk.size:
+            recall_score = np.nan
+            precision_score = np.nan
+            f1_score = np.nan
+            mean_score = np.nan
+            threshold = np.nan
+        else:
+            idx_recall_at_topk = idx_recall_above_topk[0]-1 # get first threshold that enables recall higher than 0.7
+            #print(idx_recall_above_70[:3])
+            recall_score = recall[idx_recall_at_topk]
+            precision_score = precision[idx_recall_at_topk]
+            f1_score = f1score(precision_score,recall_score)
+            mean_score = (recall_score + precision_score) / 2
+            threshold = thresholds[idx_recall_at_topk]
+        res[diag] = dict(recall_score=recall_score,precision_score=precision_score,
+                         f1_score=f1_score,mean_score=mean_score,
+                         threshold=threshold, positives=positives,prevalence=prevalence,
+                         all_recalls=recall,
+                         all_thresholds=thresholds
+                        )
+
+    return pd.DataFrame(data=res).T
+
+
+def compute_thresholds_posterior_predictive(dataset_dict,models_dict):
+    all_logits = list()
+    all_targets = list()
+    print('iterating dataset to obtain logits and targets')
+    for diag in tqdm(dataset_dict):
+        X = dataset_dict[diag]['features'].detach().numpy()
+        y = dataset_dict[diag]['target']
+        logits = models_dict[diag]['pipeline'].predict_proba(X)[:,1]
+        all_logits.append(logits)
+        all_targets.append(y)
+
+
+    f1score = lambda precision,recall: 2 * precision * recall / (precision + recall)
+
+    scores_db = {'f1_score':f1score}#,'prec_focus':weighted_average(0.6,0.4),'recall_focus':weighted_average(0.4,0.6)}
+
+    max_scores = {key:list() for key in scores_db}
+    best_thresholds = {key:list() for key in scores_db}
+    all_prevalence = list()
+    all_positives = list()
+
+    num_elements = sum([sum(e) for e in all_targets]) # total number of positives
+
+
+    print(f'Computing the thresholds for each of the {len(dataset_dict.keys())} diagnostics')
+    for diag in tqdm(range(len(dataset_dict))):
+        if len(dataset_dict[diag]['target']) > 0:
+            precision, recall, thresholds = precision_recall_curve(all_targets[diag],
+                                                                   all_logits[diag])
+
+            positives = all_targets[diag].sum().item()
+            prevalence = positives / num_elements
+
+            for scoring_fun in scores_db:
+
+                scores = scores_db[scoring_fun](precision,recall)
+
+                try:
+                    max_idx = np.nanargmax(scores)
+                    best_score = scores[max_idx]
+                    best_ths = thresholds[max_idx]
+                except:
+                    best_score = np.nan
+                    best_ths = np.nan
+
+                max_scores[scoring_fun].append(best_score)
+                best_thresholds[scoring_fun].append(best_ths)
+        else:
+            for scoring_fun in scores_db:
+                best_score = np.nan
+                best_ths = np.nan
+                
+                max_scores[scoring_fun].append(best_score)
+                best_thresholds[scoring_fun].append(best_ths)
+        all_prevalence.append(prevalence)
+        all_positives.append(positives)
+
+
+    return pd.DataFrame(data=[max_scores['f1_score'],best_thresholds['f1_score'],all_prevalence,all_positives],
+             index=["f1_score","best_thresholds","all_prevalence","all_positives"]
+        ).T.astype({'f1_score':float,'best_thresholds':float,'all_prevalence':float,'all_positives':int})
+
+def compute_best_f1_threshold(golden,logits):
+    assert len(golden) == len(logits)
+    
+    f1score = lambda precision,recall: 2 * precision * recall / (precision + recall)
+    
+    try:
+        precision, recall, thresholds = precision_recall_curve(golden,logits)
+        scores = [f1score(prec,recall) for prec,recall in zip(precision,recall)]
+        max_idx = np.nanargmax(scores)
+        best_score = scores[max_idx]
+        best_ths = thresholds[max_idx]
+        avgprec=average_precision_score(golden,logits)
+    except Exception as e:
+        best_score = np.nan
+        best_ths = np.nan
+        avgprec= np.nan
+    return dict(threshold=best_ths,f1_score=best_score,avgprec=avgprec)
+    
 
 ###############################################################
 ######################## Target statistics ####################
@@ -845,6 +1750,7 @@ def compute_positives_batch(batch,how : str='all',timestep_selector:Callable=Non
     assert how in ['all','each'], 'Oops'
     
     targets = batch['target_sequence']
+    lengths = batch['length']
     if timestep_selector is not None:
         mask = timestep_selector(lengths)
         targets = targets[mask,:]
@@ -852,9 +1758,9 @@ def compute_positives_batch(batch,how : str='all',timestep_selector:Callable=Non
     positives_per_diag = targets.sum(axis=0).tolist()
     
     if how == 'all':
-        return sum(targets)
+        return sum(positives_per_diag)
     else:
-        return {label:value for label,value in enumerate(targets)}
+        return {label:value for label,value in enumerate(positives_per_diag)}
     
 def compute_positives_dataloader(dataloader,how : str='all',timestep_selector:Callable=None):
     assert how in ['all','each'], 'Oops'
@@ -963,7 +1869,7 @@ def compute_prevalence_dataloader(dataloader,how='all',timestep_selector:Callabl
 ########################## UTILS ############################
 #############################################################
 
-def compute_n_preds_batch(model,batch,thresholds : dict,how:str='all',timestep_selector:Callable=None):
+def compute_n_preds_batch(model,batch,thresholds : dict,topk=None,how:str='all',timestep_selector:Callable=None):
     """
     Computes number of predictions
     """
@@ -979,7 +1885,7 @@ def compute_n_preds_batch(model,batch,thresholds : dict,how:str='all',timestep_s
         mask = timestep_selector(lengths)
         logits = logits[mask,:]
 
-    preds = logits2preds(logits,thresholds)
+    preds = logits2preds(logits,thresholds,topk)
     
     if how == 'all':
         n_preds = (preds == 1).sum().item()
@@ -1034,56 +1940,105 @@ def create_random_batch(size:int, dataset : Dataset, collate_fn, manual_seed=232
     batch = next(iter(small_dataloader))
     return batch
 
+    
+########### CONFIDENCE AND ECE ###########
 
-################################################
-############### WORK IN PROGRESS ###############
-################################################
+def compute_starting_info_for_confidence_analysis_dataloader(model,dataloader,thresholds,topk:None):
+    """
+    returns the logits, preds and golden of a dataloader.
+    if thresholds then topk should be none. If topk is specified, then it has priority over thresholds.
+    """
+    all_adm_indexes = list()
+    all_pids = list()
+    all_logits = list()
+    all_preds = list()
+    all_golden = list()
+    for batch in tqdm(dataloader):
+        logits = compute_model_logits_batch(model,batch)
+        preds = compute_model_preds_batch(model,batch,thresholds,topk)
+        target = batch['target_sequence']
 
+        all_logits.append(logits)
+        all_preds.append(preds)
+        all_golden.append(target)
 
-from torchmetrics import Metric
-class RecordRecall(Metric):
-    def __init__(self,average='macro'):
-        full_state_update=False
-        super().__init__()
-        self.add_state("record_recall", default=torch.tensor(0,dtype=float), dist_reduce_fx="sum")
-        self.add_state("total_records", default=torch.tensor(0,dtype=float), dist_reduce_fx="sum")
-        self.add_state("undefined", default=torch.tensor(0,dtype=float), dist_reduce_fx="sum")
-        self.average = average
-        
-    def update(self, preds: torch.Tensor, target: torch.Tensor):
-        """
-        preds and target must be ones and zeros
-        shape of both must be (records, labels)
-        
-        i think this fails when there are records in target that has no positive labels (divide by zero)
-        """
-        
-        assert preds.shape == target.shape
-        assert len(preds.shape) == 2 and len(target.shape) == 2
-        assert (preds == 1).sum().sum() + (preds == 0).sum().sum() == preds.shape[0] * preds.shape[1], 'must be only zeros and ones'
-        assert (target == 1).sum().sum() + (target == 0).sum().sum() == target.shape[0] * target.shape[1], 'must be only zeros and ones'
-        
-        
-        self.undefined += (torch.sum(target,axis=-1) == 0).sum()
-        # non-zero targets
-        non_zero_records = torch.where(torch.sum(target,axis=-1) != 0)[0]
-        target = target[non_zero_records]
-        preds = preds[non_zero_records]
-        
-        TP = (preds == 1) & (target == 1)
-        FN = (preds == 0) & (target == 1)
-        P = target == 1
-        
-        if self.average == 'macro':
-            self.record_recall += (TP.sum(axis=1) / (TP.sum(axis=-1) + FN.sum(axis=-1))).sum()
-            self.total_records += target.shape[0]
-        elif self.average == 'weighted':
-            self.record_recall += ((TP.sum(axis=1) / (TP.sum(axis=-1) + FN.sum(axis=-1))) * P.sum(axis=-1)).sum()
-            self.total_records += P.sum().sum()
-        else:
-            raise ValueError('choose an accepted average value')
+        # get pids and adm_index of each sequence
+        pids = batch['pid']
+        lengths = batch['length']
+        pids = [[pid]*lengths[idx] for idx,pid in enumerate(pids)]
+        adm_index = [idx+1 for sublist in pids for idx,_ in enumerate(sublist)]
+        pids = [item for sublist in pids for item in sublist] # flatten
 
-    def compute(self):
-        return {'value':(self.record_recall.float() / self.total_records).item(),
-                'undefined':self.undefined.item()
-               }
+        all_pids.extend(pids)
+        all_adm_indexes.extend(adm_index)
+
+    all_logits = torch.vstack(all_logits)
+    all_preds = torch.vstack(all_preds)
+    all_golden = torch.vstack(all_golden)
+
+    logits_df = pd.DataFrame(all_logits.detach().numpy())
+    logits_df.loc[:,'pid'] = all_pids
+    logits_df.loc[:,'adm_index'] = all_adm_indexes
+    logits_df = logits_df.set_index(['pid','adm_index']).sort_index()
+
+    preds_df = pd.DataFrame(all_preds.detach().numpy())
+    preds_df.loc[:,'pid'] = all_pids
+    preds_df.loc[:,'adm_index'] = all_adm_indexes
+    preds_df = preds_df.set_index(['pid','adm_index']).sort_index()
+
+    golden_df = pd.DataFrame(all_golden.detach().numpy())
+    golden_df.loc[:,'pid'] = all_pids
+    golden_df.loc[:,'adm_index'] = all_adm_indexes
+    golden_df = golden_df.set_index(['pid','adm_index']).sort_index()
+    
+    return logits_df,preds_df,golden_df
+
+def compute_ece(logits, preds, goldens, nbins:int = 10,use_positives=False):
+    """
+    works either receiving all as pd.DataFrame (multiple classes) or all as pd.Series (1 class)
+    
+    dataframes have in each column the label and each row is an admission from a patient
+    """
+
+    preds_mask = preds == 1
+    if use_positives == False:
+        confidences = logits.where(preds_mask)
+        accuracies = (preds == goldens).where(preds_mask) # only counting positions where a prediction occurs
+    else:
+        confidences = logits
+        accuracies = goldens
+
+    bins = np.linspace(0,1,nbins+1)
+    
+    ece = 0
+
+    weights = list()
+    accs_in_bin = list()
+    avgs_confidences = list()
+    bin_ces = list()
+    n_bins = list()
+
+    for left,right in zip(bins[:-1],bins[1:]):
+        in_bin = ((confidences > left) & (confidences < right))
+
+        # avg acc in bin
+        accs_in_bin.append(np.nanmean(accuracies[in_bin]))
+
+        # avg confidence in bin
+        avgs_confidences.append(np.nanmean(confidences[in_bin]))
+        
+        # bin-wise calibration error
+        bin_ces.append(abs(accs_in_bin[-1] - avgs_confidences[-1]))
+
+        n = np.nansum(in_bin)
+        n_bins.append(n)
+
+        ece += n * bin_ces[-1]
+        
+    ece /= sum(n_bins)
+    
+    weights = [e/sum(n_bins) for e in n_bins]
+    
+    center_of_mass = sum([avgs_confidences[i]*weights[i] for i,_ in enumerate(avgs_confidences)]) / sum(weights)
+
+    return dict(com=center_of_mass,ece=ece,bin_ces=bin_ces,n_bins=n_bins,bin_acc=accs_in_bin,nbins=nbins,bins=bins,avg_confidences=avgs_confidences)
